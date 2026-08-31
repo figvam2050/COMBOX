@@ -19,7 +19,7 @@ The MCU on the board is GD32F305RCT6. We use the genericSTM32F103RC PlatformIO b
 - Application region: 240 KiB
 
 BUILD ARTIFACT CHECK:
-- The last successful PlatformIO build produced firmware.bin and firmware.hex.
+- The last successful PlatformIO build automatically copied firmware.bin and firmware.hex to the `compiled_firmware/` directory.
 - firmware.bin size: 15,204 bytes.
 - firmware.hex contains the same 15,204 bytes of application data.
 - Both files start at flash address 0x08004000; the bootloader area is not included.
