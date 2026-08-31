@@ -34,7 +34,7 @@
 ; Частина platformio.ini, яка відповідає за безпеку:
 upload_protocol = stlink
 board_upload.offset_address = 0x08004000
-board_build.ldscript = STM32F103RC_COMBOX.ld
+board_build.ldscript = GD32F305RC_COMBOX.ld
 ```
 
 Процес прошивки максимально простий:
