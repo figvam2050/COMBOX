@@ -21,14 +21,15 @@ The MCU on the board is **GD32F305RCT6**. We use the `genericSTM32F103RC` Platfo
 - **Application region:** 240 KiB
 
 ## Build Artifacts
-- The last successful PlatformIO build automatically copied `firmware.bin` and `firmware.hex` to the `compiled_firmware/` directory.
+- A successful PlatformIO build automatically copies `firmware.bin` and `firmware.hex` to the `compiled_firmware/` directory.
 - `firmware.bin` size: 15,204 bytes.
 - `firmware.hex` contains the same 15,204 bytes of application data.
-- Both files start at flash address `0x08004000`; the bootloader area is not included.
+- Both files contain only the application starting at flash address `0x08004000`; the bootloader area is not included.
 - `firmware.bin` is addressless and **must be programmed at `0x08004000`**.
 - `firmware.hex` contains its own absolute addresses and can be loaded without entering a separate start address. Use **sector erase only** and preserve `0x08000000..0x08003FFF`.
 
 > [!WARNING]
 > **IMPORTANT STATUS:**
-> - A successful build proves that the files were generated, not that the application is ready for live use on the COM-Box.
-> - The current build still uses the `genericSTM32F103RC` board profile and STM32F1 framework as a compatibility layer for the GD32F305RCT6. UART/CAN clock settings and duplicate `VECT_TAB_OFFSET` definitions must be verified before flashing.
+> - The project builds successfully, but this does not prove live hardware compatibility.
+> - The `genericSTM32F103RC` board profile and STM32F1 framework are used only as a compatibility layer for the GD32F305RCT6. The current register timing assumes the framework's actual APB1 clock of 32 MHz; verify UART/CAN timing on hardware before relying on communications.
+> - The generated compile database is machine-specific and ignored by Git. VS Code/clangd should use the portable `.vscode/settings.json` configuration instead.

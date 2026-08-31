@@ -1,5 +1,5 @@
 {
     "clangd.arguments": [
-        "--query-driver=/Users/vlad/.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-none-eabi-*"
+        "--query-driver=${userHome}/.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-none-eabi-*"
     ]
 }

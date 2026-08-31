@@ -1,4 +1,4 @@
-#include <Arduino.h> 
+#include <Arduino.h>
 #include <algorithm>
 
 /*
@@ -139,7 +139,7 @@ uint16_t calculateCRC16(const uint8_t *buf, uint16_t len) {
 }
 
 // -----------------------------------------------------------------------------
-// USART2: BMS RS485, 9600 8N1 (APB1 = 36 MHz assumption)
+// USART2: BMS RS485, 9600 8N1 (APB1 = 32 MHz with the selected F1 framework)
 // -----------------------------------------------------------------------------
 void initUSART2_BMS() {
   RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
@@ -157,8 +157,8 @@ void initUSART2_BMS() {
   USART2->CR2 = 0;
   USART2->CR3 = 0;
 
-  // 36 MHz / 9600 = 3750 => BRR 0xEA6 for oversampling x16.
-  USART2->BRR = 0xEA6;
+  // 32 MHz / 9600 = 3333.33 => mantissa 208, fraction 5 => BRR 0xD05.
+  USART2->BRR = 0xD05;
   USART2->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
 }
 
@@ -183,9 +183,9 @@ void USART2_Flush() {
 }
 
 // -----------------------------------------------------------------------------
-// CAN1 500 kbps, APB1 = 36 MHz, PA11 RX / PA12 TX
-// 36 MHz / (BRP 4 * 18 tq) = 500 kbit/s
-// TS1 = 12 tq, TS2 = 5 tq, SJW = 2 tq.
+// CAN1 500 kbps, APB1 = 32 MHz, PA11 RX / PA12 TX
+// 32 MHz / (BRP 4 * 16 tq) = 500 kbit/s
+// TS1 = 11 tq, TS2 = 4 tq, SJW = 2 tq.
 // -----------------------------------------------------------------------------
 bool initCAN_500k() {
   RCC->APB1ENR |= RCC_APB1ENR_CAN1EN;
@@ -215,10 +215,10 @@ bool initCAN_500k() {
 
   // bxCAN BTR fields:
   // SJW bits 25:24 => 1 means 2 tq
-  // TS2 bits 22:20 => 4 means 5 tq
-  // TS1 bits 19:16 => 11 means 12 tq
+  // TS2 bits 22:20 => 3 means 4 tq
+  // TS1 bits 19:16 => 10 means 11 tq
   // BRP bits 9:0   => 3 means prescaler 4
-  CAN1->BTR = (1U << 24) | (4U << 20) | (11U << 16) | 3U;
+  CAN1->BTR = (1U << 24) | (3U << 20) | (10U << 16) | 3U;
 
   // Auto bus-off recovery + automatic retransmission enabled.
   CAN1->MCR |= CAN_MCR_ABOM;
