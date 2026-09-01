@@ -9,16 +9,34 @@
   1) This file fixes application logic only.
   2) The stock Felicity bootloader/application offset (0x08004000) must be
   handled in the linker script / PlatformIO configuration, NOT in main.cpp. 3)
-  Hardware pin mapping must still be verified on the actual COM-Box PCB.
+  Factory-confirmed pins below were extracted from the original firmware dump.
 */
 
 // -----------------------------------------------------------------------------
 // HARDWARE PINS (VERIFY ON REAL PCB)
 // -----------------------------------------------------------------------------
-#define PIN_LED_RUN PB0
-#define PIN_LED_485 PB1
-#define PIN_LED_CAN PB2
-#define PIN_RS485_DIR PA1 // DE/RE for battery RS485
+#define PIN_LED_RUN PB0 // not factory-confirmed; keep configurable
+#define PIN_LED_485 PB1 // not factory-confirmed; keep configurable
+#define PIN_LED_CAN PB2 // not factory-confirmed; keep configurable
+#define PIN_RS485_DIR PA1 // RS485 DE/RE still requires PCB verification
+
+// Factory firmware: UART5 at 0x40005000, PC12 TX and PD2 RX.
+#define COMBOX_UART5 ((USART_TypeDef *)0x40005000UL)
+
+// Factory firmware: CAN1 remapped to PB8 RX and PB9 TX.
+#define COMBOX_CAN_REMAP 0x00004000UL
+
+// Factory DIP reader: PB15=8, PB14=4, PB13=2, PB12=1, active low.
+uint8_t readFactoryDipAddress() {
+  const uint32_t masks[] = {1UL << 15, 1UL << 14, 1UL << 13, 1UL << 12};
+  const uint8_t weights[] = {8, 4, 2, 1};
+  uint8_t value = 0;
+  for (uint8_t i = 0; i < 4; i++) {
+    if ((GPIOB->IDR & masks[i]) == 0)
+      value += weights[i];
+  }
+  return value;
+}
 
 // Deye uses CAN in this firmware. The second RS485 path from the old draft is
 // intentionally disabled because PB12 was only a guess and is not needed.
@@ -139,70 +157,68 @@ uint16_t calculateCRC16(const uint8_t *buf, uint16_t len) {
 }
 
 // -----------------------------------------------------------------------------
-// USART2: BMS RS485, 9600 8N1 (APB1 = 32 MHz with the selected F1 framework)
+// UART5: BMS RS485, 9600 8N1 (factory-confirmed PC12 TX / PD2 RX)
 // -----------------------------------------------------------------------------
-void initUSART2_BMS() {
-  RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
-  RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
+void initUART5_BMS() {
+  RCC->APB1ENR |= (1UL << 20); // UART5EN
+  RCC->APB2ENR |= (1UL << 4) | (1UL << 5); // GPIOCEN, GPIODEN
 
-  // PA3 RX floating input
-  GPIOA->CRL &= ~(GPIO_CRL_CNF3 | GPIO_CRL_MODE3);
-  GPIOA->CRL |= (0x04 << 12);
+  // PC12 TX: alternate-function push-pull, 50 MHz.
+  GPIOC->CRH &= ~(0xFUL << 16);
+  GPIOC->CRH |= (0xBUL << 16);
 
-  // PA2 TX AF push-pull 50 MHz
-  GPIOA->CRL &= ~(GPIO_CRL_CNF2 | GPIO_CRL_MODE2);
-  GPIOA->CRL |= (0x0A << 8);
+  // PD2 RX: floating input.
+  GPIOD->CRL &= ~(0xFUL << 8);
+  GPIOD->CRL |= (0x4UL << 8);
 
-  USART2->CR1 = 0;
-  USART2->CR2 = 0;
-  USART2->CR3 = 0;
+  COMBOX_UART5->CR1 = 0;
+  COMBOX_UART5->CR2 = 0;
+  COMBOX_UART5->CR3 = 0;
 
   // 32 MHz / 9600 = 3333.33 => mantissa 208, fraction 5 => BRR 0xD05.
-  USART2->BRR = 0xD05;
-  USART2->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
+  COMBOX_UART5->BRR = 0xD05;
+  COMBOX_UART5->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
 }
 
-void USART2_Write(uint8_t data) {
-  while (!(USART2->SR & USART_SR_TXE)) {
+void UART5_Write(uint8_t data) {
+  while (!(COMBOX_UART5->SR & USART_SR_TXE)) {
   }
-  USART2->DR = data;
+  COMBOX_UART5->DR = data;
 }
 
-void USART2_WriteBuffer(const uint8_t *data, uint16_t len) {
+void UART5_WriteBuffer(const uint8_t *data, uint16_t len) {
   for (uint16_t i = 0; i < len; i++)
-    USART2_Write(data[i]);
+    UART5_Write(data[i]);
 }
 
-bool USART2_Available() { return (USART2->SR & USART_SR_RXNE) != 0; }
+bool UART5_Available() { return (COMBOX_UART5->SR & USART_SR_RXNE) != 0; }
 
-uint8_t USART2_Read() { return (uint8_t)USART2->DR; }
+uint8_t UART5_Read() { return (uint8_t)COMBOX_UART5->DR; }
 
-void USART2_Flush() {
-  while (!(USART2->SR & USART_SR_TC)) {
+void UART5_Flush() {
+  while (!(COMBOX_UART5->SR & USART_SR_TC)) {
   }
 }
 
 // -----------------------------------------------------------------------------
-// CAN1 500 kbps, APB1 = 32 MHz, PA11 RX / PA12 TX
+// CAN1 500 kbps, APB1 = 32 MHz, factory remap PB8 RX / PB9 TX
 // 32 MHz / (BRP 4 * 16 tq) = 500 kbit/s
 // TS1 = 11 tq, TS2 = 4 tq, SJW = 2 tq.
 // -----------------------------------------------------------------------------
 bool initCAN_500k() {
   RCC->APB1ENR |= RCC_APB1ENR_CAN1EN;
-  RCC->APB2ENR |= RCC_APB2ENR_AFIOEN | RCC_APB2ENR_IOPAEN;
+  RCC->APB2ENR |= RCC_APB2ENR_AFIOEN | (1UL << 3); // AFIOEN, GPIOBEN
 
-  // CAN_RX PA11 floating input
-  GPIOA->CRH &= ~(GPIO_CRH_CNF11 | GPIO_CRH_MODE11);
-  GPIOA->CRH |= (0x04 << 12);
+  // CAN_RX PB8 floating input.
+  GPIOB->CRH &= ~(0xFUL << 0);
+  GPIOB->CRH |= (0x4UL << 0);
 
-  // CAN_TX PA12 AF push-pull 50 MHz
-  GPIOA->CRH &= ~(GPIO_CRH_CNF12 | GPIO_CRH_MODE12);
-  GPIOA->CRH |= (0x0A << 16);
+  // CAN_TX PB9 alternate-function push-pull, 50 MHz.
+  GPIOB->CRH &= ~(0xFUL << 4);
+  GPIOB->CRH |= (0xBUL << 4);
 
-  // Make sure CAN is on default PA11/PA12 mapping.
-#ifdef AFIO_MAPR_CAN_REMAP
-  AFIO->MAPR &= ~AFIO_MAPR_CAN_REMAP;
-#endif
+  // CAN remap value confirmed in the factory initialization sequence.
+  AFIO->MAPR = (AFIO->MAPR & ~0x00006000UL) | COMBOX_CAN_REMAP;
 
   CAN1->MCR &= ~CAN_MCR_SLEEP;
   CAN1->MCR |= CAN_MCR_INRQ;
@@ -318,13 +334,13 @@ void sendBmsRequest(uint8_t address) {
   req[7] = (uint8_t)(crc >> 8);
 
   // Drain stale RX bytes before a new transaction.
-  while (USART2_Available())
-    (void)USART2_Read();
+  while (UART5_Available())
+    (void)UART5_Read();
 
   digitalWrite(PIN_RS485_DIR, HIGH);
   delayMicroseconds(100);
-  USART2_WriteBuffer(req, sizeof(req));
-  USART2_Flush();
+  UART5_WriteBuffer(req, sizeof(req));
+  UART5_Flush();
   delayMicroseconds(100);
   digitalWrite(PIN_RS485_DIR, LOW);
 }
@@ -602,7 +618,7 @@ void setup() {
   digitalWrite(PIN_LED_CAN, LOW);
   digitalWrite(PIN_RS485_DIR, LOW);
 
-  initUSART2_BMS();
+  initUART5_BMS();
   canReady = initCAN_500k();
 
   for (uint8_t i = 0; i < MAX_BATTERIES; i++) {
@@ -624,8 +640,8 @@ void loop() {
       responseStartTime = now;
     }
   } else {
-    while (USART2_Available()) {
-      uint8_t b = USART2_Read();
+    while (UART5_Available()) {
+      uint8_t b = UART5_Read();
       if (rxIndex < sizeof(rxBuffer))
         rxBuffer[rxIndex++] = b;
 

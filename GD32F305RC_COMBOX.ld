@@ -1,12 +1,12 @@
 /*
- * Felicity COM-Box application linker script
+ * Standalone COM-Box firmware linker script
  * Target profile: PlatformIO genericSTM32F103RC
  *
  * IMPORTANT:
- *   0x08000000 .. 0x08003FFF : preserve Felicity bootloader (16 KiB)
- *   0x08004000 .. 0x0803FFFF : application (240 KiB)
+ *   0x08000000 .. 0x0803FFFF : standalone firmware (256 KiB)
  *
- * This memory layout follows the board profile selected in platformio.ini.
+ * The original Felicity bootloader is intentionally not reserved: the board
+ * is programmed with our complete standalone firmware image.
  * Verify the actual MCU marking / flash size before first destructive ST-Link write.
  */
 
@@ -20,7 +20,7 @@ _Min_Stack_Size = 0x400;
 MEMORY
 {
   RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 96K
-  FLASH (rx)  : ORIGIN = 0x08004000, LENGTH = 240K
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 256K
 }
 
 SECTIONS
