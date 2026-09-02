@@ -30,5 +30,6 @@ The MCU on the board is **GD32F305RCT6**. We use the `genericSTM32F103RC` Platfo
 > [!WARNING]
 > **IMPORTANT STATUS:**
 > - The project builds successfully, but this does not prove live hardware compatibility.
-> - The `genericSTM32F103RC` board profile and STM32F1 framework are used only as a compatibility layer for the GD32F305RCT6. The current register timing assumes the framework's actual APB1 clock of 32 MHz; verify UART/CAN timing on hardware before relying on communications.
+> - The `genericSTM32F103RC` board profile and STM32F1 framework are used only as a compatibility layer for the GD32F305RCT6. BMS UART baud timing is calculated from the runtime APB2 clock; CAN currently assumes APB1 = 32 MHz. Verify both buses with an analyzer before relying on communications.
+> - Factory analysis identifies BMS-485 as USART1 (`PA9`/`PA10`), PCS-485 as UART5 (`PC12`/`PD2`), and PCS-CAN as CAN1 (`PB8`/`PB9`). See `FACTORY_PIN_ANALYSIS.md` for evidence and remaining electrical checks.
 > - The generated compile database is machine-specific and ignored by Git. VS Code/clangd should use the portable `.vscode/settings.json` configuration instead.

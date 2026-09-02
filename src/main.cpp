@@ -6,27 +6,34 @@
   Revised main.cpp
 
   IMPORTANT:
-  1) This file fixes application logic only.
-  2) The stock Felicity bootloader/application offset (0x08004000) must be
-  handled in the linker script / PlatformIO configuration, NOT in main.cpp. 3)
-  Factory-confirmed pins below were extracted from the original firmware dump.
+  1) This is standalone firmware linked at 0x08000000; the factory application
+     in the backup starts at 0x08004000.
+  2) Factory-confirmed pins below were extracted from the original firmware
+     dump. See FACTORY_PIN_ANALYSIS.md for evidence and confidence levels.
 */
 
 // -----------------------------------------------------------------------------
-// HARDWARE PINS (VERIFY ON REAL PCB)
+// FACTORY-CONFIRMED HARDWARE PINS
 // -----------------------------------------------------------------------------
-#define PIN_LED_RUN PB0 // not factory-confirmed; keep configurable
-#define PIN_LED_485 PB1 // not factory-confirmed; keep configurable
-#define PIN_LED_CAN PB2 // not factory-confirmed; keep configurable
-#define PIN_RS485_DIR PA1 // RS485 DE/RE still requires PCB verification
+#define PIN_LED_RUN PB0
+#define PIN_LED_BMS_485 PB1
+#define PIN_LED_PCS_CAN PC5
+#define PIN_LED_PCS_485 PC13
 
-// Factory firmware: UART5 at 0x40005000, PC12 TX and PD2 RX.
-#define COMBOX_UART5 ((USART_TypeDef *)0x40005000UL)
+// Factory firmware keeps these two outputs at fixed levels. Their electrical
+// names (enable, DE, /RE, etc.) require a PCB continuity test.
+#define PIN_FACTORY_CTRL_LOW PC3
+#define PIN_FACTORY_CTRL_HIGH PC4
+
+// Factory serial channel 0 polls the BMS through USART1: PA9 TX, PA10 RX.
+#define COMBOX_BMS_USART ((USART_TypeDef *)0x40013800UL)
 
 // Factory firmware: CAN1 remapped to PB8 RX and PB9 TX.
 #define COMBOX_CAN_REMAP 0x00004000UL
 
 // Factory DIP reader: PB15=8, PB14=4, PB13=2, PB12=1, active low.
+uint8_t selectedDipValue = 0;
+
 uint8_t readFactoryDipAddress() {
   const uint32_t masks[] = {1UL << 15, 1UL << 14, 1UL << 13, 1UL << 12};
   const uint8_t weights[] = {8, 4, 2, 1};
@@ -38,8 +45,8 @@ uint8_t readFactoryDipAddress() {
   return value;
 }
 
-// Deye uses CAN in this firmware. The second RS485 path from the old draft is
-// intentionally disabled because PB12 was only a guess and is not needed.
+// Deye uses CAN in this firmware, so the factory PCS-485 UART5 path is not
+// initialized. The DIP value is captured at startup and reserved for profiles.
 
 // -----------------------------------------------------------------------------
 // BATTERY / PROTOCOL SETTINGS
@@ -157,46 +164,49 @@ uint16_t calculateCRC16(const uint8_t *buf, uint16_t len) {
 }
 
 // -----------------------------------------------------------------------------
-// UART5: BMS RS485, 9600 8N1 (factory-confirmed PC12 TX / PD2 RX)
+// BMS RS485: USART1, 9600 8N1 (factory-confirmed PA9 TX / PA10 RX)
 // -----------------------------------------------------------------------------
-void initUART5_BMS() {
-  RCC->APB1ENR |= (1UL << 20); // UART5EN
-  RCC->APB2ENR |= (1UL << 4) | (1UL << 5); // GPIOCEN, GPIODEN
+void initBmsUart() {
+  RCC->APB2ENR |= (1UL << 14) | (1UL << 2); // USART1EN, GPIOAEN
 
-  // PC12 TX: alternate-function push-pull, 50 MHz.
-  GPIOC->CRH &= ~(0xFUL << 16);
-  GPIOC->CRH |= (0xBUL << 16);
+  // PA9 TX: alternate-function push-pull, 50 MHz.
+  GPIOA->CRH &= ~(0xFUL << 4);
+  GPIOA->CRH |= (0xBUL << 4);
 
-  // PD2 RX: floating input.
-  GPIOD->CRL &= ~(0xFUL << 8);
-  GPIOD->CRL |= (0x4UL << 8);
+  // PA10 RX: floating input.
+  GPIOA->CRH &= ~(0xFUL << 8);
+  GPIOA->CRH |= (0x4UL << 8);
 
-  COMBOX_UART5->CR1 = 0;
-  COMBOX_UART5->CR2 = 0;
-  COMBOX_UART5->CR3 = 0;
+  COMBOX_BMS_USART->CR1 = 0;
+  COMBOX_BMS_USART->CR2 = 0;
+  COMBOX_BMS_USART->CR3 = 0;
 
-  // 32 MHz / 9600 = 3333.33 => mantissa 208, fraction 5 => BRR 0xD05.
-  COMBOX_UART5->BRR = 0xD05;
-  COMBOX_UART5->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
+  // For 16x oversampling BRR is PCLK2 / baud. Read PCLK2 at runtime so this
+  // remains correct if the framework clock setup changes.
+  COMBOX_BMS_USART->BRR =
+      (HAL_RCC_GetPCLK2Freq() + (9600U / 2U)) / 9600U;
+  COMBOX_BMS_USART->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
 }
 
-void UART5_Write(uint8_t data) {
-  while (!(COMBOX_UART5->SR & USART_SR_TXE)) {
+void bmsUartWrite(uint8_t data) {
+  while (!(COMBOX_BMS_USART->SR & USART_SR_TXE)) {
   }
-  COMBOX_UART5->DR = data;
+  COMBOX_BMS_USART->DR = data;
 }
 
-void UART5_WriteBuffer(const uint8_t *data, uint16_t len) {
+void bmsUartWriteBuffer(const uint8_t *data, uint16_t len) {
   for (uint16_t i = 0; i < len; i++)
-    UART5_Write(data[i]);
+    bmsUartWrite(data[i]);
 }
 
-bool UART5_Available() { return (COMBOX_UART5->SR & USART_SR_RXNE) != 0; }
+bool bmsUartAvailable() {
+  return (COMBOX_BMS_USART->SR & USART_SR_RXNE) != 0;
+}
 
-uint8_t UART5_Read() { return (uint8_t)COMBOX_UART5->DR; }
+uint8_t bmsUartRead() { return (uint8_t)COMBOX_BMS_USART->DR; }
 
-void UART5_Flush() {
-  while (!(COMBOX_UART5->SR & USART_SR_TC)) {
+void bmsUartFlush() {
+  while (!(COMBOX_BMS_USART->SR & USART_SR_TC)) {
   }
 }
 
@@ -334,15 +344,13 @@ void sendBmsRequest(uint8_t address) {
   req[7] = (uint8_t)(crc >> 8);
 
   // Drain stale RX bytes before a new transaction.
-  while (UART5_Available())
-    (void)UART5_Read();
+  while (bmsUartAvailable())
+    (void)bmsUartRead();
 
-  digitalWrite(PIN_RS485_DIR, HIGH);
-  delayMicroseconds(100);
-  UART5_WriteBuffer(req, sizeof(req));
-  UART5_Flush();
-  delayMicroseconds(100);
-  digitalWrite(PIN_RS485_DIR, LOW);
+  // The factory application does not toggle PA1 (or another GPIO) around this
+  // transmission. The PCB handles direction while PC3/PC4 remain fixed.
+  bmsUartWriteBuffer(req, sizeof(req));
+  bmsUartFlush();
 }
 
 // -----------------------------------------------------------------------------
@@ -577,9 +585,9 @@ void sendDeyeCanFrames() {
   }
 
   if (allOk) {
-    digitalWrite(PIN_LED_CAN, HIGH);
+    digitalWrite(PIN_LED_PCS_CAN, HIGH);
     delay(2);
-    digitalWrite(PIN_LED_CAN, LOW);
+    digitalWrite(PIN_LED_PCS_CAN, LOW);
   }
 }
 
@@ -608,17 +616,27 @@ uint8_t activeSlotCount() { return USE_MASTER_ONLY ? 1 : MAX_BATTERIES; }
 bool canReady = false;
 
 void setup() {
+  pinMode(PB12, INPUT_PULLUP);
+  pinMode(PB13, INPUT_PULLUP);
+  pinMode(PB14, INPUT_PULLUP);
+  pinMode(PB15, INPUT_PULLUP);
+  selectedDipValue = readFactoryDipAddress();
+
   pinMode(PIN_LED_RUN, OUTPUT);
-  pinMode(PIN_LED_485, OUTPUT);
-  pinMode(PIN_LED_CAN, OUTPUT);
-  pinMode(PIN_RS485_DIR, OUTPUT);
+  pinMode(PIN_LED_BMS_485, OUTPUT);
+  pinMode(PIN_LED_PCS_CAN, OUTPUT);
+  pinMode(PIN_LED_PCS_485, OUTPUT);
+  pinMode(PIN_FACTORY_CTRL_LOW, OUTPUT);
+  pinMode(PIN_FACTORY_CTRL_HIGH, OUTPUT);
 
   digitalWrite(PIN_LED_RUN, HIGH);
-  digitalWrite(PIN_LED_485, LOW);
-  digitalWrite(PIN_LED_CAN, LOW);
-  digitalWrite(PIN_RS485_DIR, LOW);
+  digitalWrite(PIN_LED_BMS_485, LOW);
+  digitalWrite(PIN_LED_PCS_CAN, LOW);
+  digitalWrite(PIN_LED_PCS_485, LOW);
+  digitalWrite(PIN_FACTORY_CTRL_LOW, LOW);
+  digitalWrite(PIN_FACTORY_CTRL_HIGH, HIGH);
 
-  initUART5_BMS();
+  initBmsUart();
   canReady = initCAN_500k();
 
   for (uint8_t i = 0; i < MAX_BATTERIES; i++) {
@@ -640,17 +658,17 @@ void loop() {
       responseStartTime = now;
     }
   } else {
-    while (UART5_Available()) {
-      uint8_t b = UART5_Read();
+    while (bmsUartAvailable()) {
+      uint8_t b = bmsUartRead();
       if (rxIndex < sizeof(rxBuffer))
         rxBuffer[rxIndex++] = b;
 
       if (rxIndex == BMS_RESPONSE_LEN) {
         if (parseBmsResponse(rxBuffer, rxIndex, currentExpectedAddress,
                              currentBatteryIndex)) {
-          digitalWrite(PIN_LED_485, HIGH);
+          digitalWrite(PIN_LED_BMS_485, HIGH);
           delay(2);
-          digitalWrite(PIN_LED_485, LOW);
+          digitalWrite(PIN_LED_BMS_485, LOW);
         }
 
         waitingForResponse = false;

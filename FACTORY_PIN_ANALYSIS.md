@@ -1,51 +1,92 @@
-# Factory Pin Analysis
+# Factory Firmware Pin Analysis
 
-Source: `combobox_bkp_40000.bin`, a 256 KiB readout of the original COM-Box
-firmware, plus the PCB photographs.
-
-## Confirmed MCU connections
-
-| Function | MCU pins | Evidence |
-| --- | --- | --- |
-| BMS/RS485 UART candidate | `UART5`: `PC12` TX, `PD2` RX | UART5 peripheral `0x40005000`, 9600 baud, GPIO setup in factory code |
-| Other RS485 UART candidate | `USART1`: `PA9` TX, `PA10` RX | USART1 peripheral `0x40013800`, 9600 baud, GPIO setup in factory code |
-| PCS CAN | `CAN1` remapped: `PB8` RX, `PB9` TX | GPIOB setup and AFIO CAN remap in factory code |
-| Four DIP inputs | `PB15`, `PB14`, `PB13`, `PB12` | Direct IDR reads with masks `0x8000`, `0x4000`, `0x2000`, `0x1000` |
-
-The DIP reader uses active-low logic and weights the switches as follows:
+Source: `combobox_bkp_40000.bin`, a 262,144-byte full-flash readout of the
+original COM-Box, plus PCB photographs.
 
 ```text
-PB15 = 8, PB14 = 4, PB13 = 2, PB12 = 1
+SHA-256: 2c3c0f22812db4e449603d5e59a879f15b963becd3f8b152cb50e426738d0731
+Factory boot vector: 0x08000000
+Factory application vector: 0x08004000
 ```
+
+The addresses below refer to the loaded factory image. They are reverse-
+engineering evidence, not addresses in the new standalone firmware.
+
+## Confirmed interfaces
+
+| Function | MCU pins | Factory evidence | Confidence |
+| --- | --- | --- | --- |
+| BMS-485 | `USART1`: `PA9` TX, `PA10` RX | USART1 `0x40013800`, 9600 8N1; logical serial channel 0; channel 0 generates the BMS Modbus request `1E 03 01 00 00 20 ...` | High |
+| PCS-485 | `UART5`: `PC12` TX, `PD2` RX | UART5 `0x40005000`, 9600 8N1; logical serial channel 1 and the separate PCS request handler | High |
+| PCS-CAN | `CAN1`: `PB8` RX, `PB9` TX | CAN1 GPIO setup and AFIO remap in the factory initialization near `0x080061A8` | High |
+| DIP switch 4 | `PB15` | Active-low input, weight 8 | High |
+| DIP switch 3 | `PB14` | Active-low input, weight 4 | High |
+| DIP switch 2 | `PB13` | Active-low input, weight 2 | High |
+| DIP switch 1 | `PB12` | Active-low input, weight 1 | High |
+
+The DIP reader is at approximately `0x08008E90`. Its numeric value is:
+
+```text
+value = (!PB15 * 8) + (!PB14 * 4) + (!PB13 * 2) + (!PB12 * 1)
+```
+
+The factory application converts DIP value 0 to communication address `0x10`.
 
 ## Indicators
 
-The enclosure labels, from left to right, are:
+The front-panel order and the MCU outputs are:
+
+| PCB LED | Enclosure label | MCU pin | Factory evidence | Confidence |
+| --- | --- | --- | --- | --- |
+| `LED5` | PCS-485 Connect | `PC13` | Periodic status routine writes GPIOC bit 13 | High |
+| `LED6` | PCS-CAN Connect | `PC5` | Periodic status routine writes GPIOC bit 5; associated with CAN state | High |
+| `LED4` | BMS-485 Connect | `PB1` | Periodic status routine writes GPIOB bit 1; associated with BMS state | High |
+| `LED3` | Running | `PB0` | Periodic status routine writes GPIOB bit 0; running/heartbeat state | High |
+
+This also agrees with the four transistor drivers `Q3`, `Q5`, `Q4`, and `Q6`
+visible on the reverse side of the PCB. `PB2` is configured as an input by the
+factory firmware, so it cannot be the PCS-CAN indicator used in the previous
+project version.
+
+## RS485 direction and control lines
+
+The factory GPIO initialization sets:
 
 ```text
-LED5 = PCS-485
-LED6 = PCS-CAN
-LED4 = BMS-485
-LED3 = Running
+PC3 = LOW
+PC4 = HIGH
 ```
 
-The factory firmware has a logical LED table for `LED3..LED6`. It directly
-configures and updates `PB0`, `PB1`, and `PC13`, but the fourth LED is accessed
-through an indirect GPIO/LED layer. Its physical MCU pin is therefore not
-declared here without a continuity test.
+No runtime writes to `PC3` or `PC4` were found around either UART transmitter.
+The factory application also does not configure or toggle `PA1`. Therefore the
+old project definition `PIN_RS485_DIR PA1` was incorrect and has been removed.
 
-## Current firmware changes
+The photographs show isolated half-duplex RS485 transceivers, but a stripped
+binary alone cannot prove whether `PC3` and `PC4` are port enables, polarity
+controls, or inputs to an external automatic-direction circuit. The new
+firmware reproduces the factory levels and relies on the PCB hardware for
+direction control. A continuity measurement from the transceiver-side `DE` and
+`/RE` pins to the MCU is still required before assigning more specific names.
 
-`src/main.cpp` now uses factory-confirmed `UART5` and CAN `PB8/PB9` instead of
-the previous guessed `USART2 PA2/PA3` and CAN `PA11/PA12`.
+## Changes applied to the standalone firmware
 
-The linker is configured for a standalone image at `0x08000000`; it no longer
-reserves the first 16 KiB for the Felicity bootloader.
+- BMS polling now uses factory channel 0: `USART1`, `PA9`/`PA10`, 9600 8N1.
+- The second RS485 channel remains identified as PCS-485 on `UART5`,
+  `PC12`/`PD2`; the current Deye implementation uses CAN and does not initialize
+  this UART.
+- CAN remains on remapped `CAN1`, `PB8`/`PB9`.
+- Indicators use `PB0`, `PB1`, `PC5`, and `PC13` according to the factory code.
+- DIP inputs `PB12` through `PB15` are initialized with pull-ups and captured at
+  startup; their value is reserved for future selectable profiles.
+- The false `PA1` DE/RE switching has been removed.
+- `PC3 LOW` and `PC4 HIGH` are established during startup to match the factory
+  application.
+- The new image is standalone at `0x08000000`; the original factory
+  bootloader/application split is not reused.
 
-The RS485 `DE/RE` pin is deliberately still a build-time constant (`PA1`) and
-is marked unconfirmed. Do not flash production hardware until this line is
-verified with a continuity test from the transceiver DE/RE pin to the MCU.
+## Remaining live tests
 
-The two UARTs cannot be assigned with complete confidence to the enclosure
-labels from the stripped binary alone. Confirm `BMS-485` versus `PCS-485` with
-a logic analyzer or by tracing each transceiver to its UART pins.
+Static analysis determines MCU usage, but it cannot verify the cable pinout,
+RS485 A/B polarity, electrical direction timing, or whether Vision address
+`0x10` returns the expected 39-register map. Verify those items with an
+oscilloscope or logic analyzer before connecting the inverter under load.
