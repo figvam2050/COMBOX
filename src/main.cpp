@@ -105,18 +105,14 @@ struct BatteryTelemetry {
   int16_t currentRaw = 0;       // 10 mA units (Discharge > 0, Charge < 0 per Vision doc)
   uint16_t cellVoltages[16] = {0};
 
-  int16_t tempPCB = 0;          // °C (Reg 18: MOS/PCB)
-  int16_t tempCell1 = 0;        // °C (Reg 19: Cell 1)
-  int16_t tempCell2 = 0;        // °C (Reg 20: Cell 2)
-  int16_t tempEnv = 0;          // °C (Reg 21: Ambient)
-  int16_t tempAvg = 0;          // °C (Average cell temp for CAN 0x356)
-  int16_t tempMax = 0;          // °C
+  int16_t tempPCB = 0;          // °C (Reg 18: Temp of PCB)
+  int16_t tempAvg = 0;          // °C (Reg 19: Temp Avg, used for CAN 0x356)
+  int16_t tempMax = 0;          // °C (Reg 20: Temp Max)
 
-  uint16_t soc = 0;             // % (0..100, Reg 22)
-  uint16_t soh = 0;             // % (0..100, Reg 23)
-  uint16_t cycleCount = 0;      // (Reg 24)
-  uint16_t remainCapRaw = 0;
-  uint16_t maxChargeCurrentRaw = 0; // A (from Reg 37 or fallback)
+  uint16_t remainCapRaw = 0;    // Ah (Reg 21: Cap Remaining)
+  uint16_t maxChargeCurrentRaw = 0; // A (Reg 22: Max charging Current)
+  uint16_t soh = 0;             // % (0..100, Reg 23: SOH)
+  uint16_t soc = 0;             // % (0..100, Reg 24: SOC)
 
   uint16_t status = 0;
   uint16_t warning = 0;
