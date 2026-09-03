@@ -38,10 +38,10 @@ The MCU on the board is **GD32F305RCT6**. We use the `genericSTM32F103RC` Platfo
 - Документовано в офіційній специфікації `MODbus Communication Protocol_15-16S-1.pdf`:
   - **Запит:** `10 03 00 00 00 27 06 91` (Master Address `0x10`, Read 39 registers from `0x0000`).
   - **Швидкість:** 9600 бод (Default), інтервал читання 300 мс.
-  - **Кабель до АКБ:** Pin 1 (A) -> Pin 6 COMBOX, Pin 3 (B) -> Pin 5 COMBOX, Pin 2 (GND) -> Pin 1 COMBOX.
+  - **Кабель до АКБ (RJ45 Vision BMS):** Pin 1 (RS485-B) -> B COMBOX, Pin 2 (RS485-A) -> A COMBOX, Pin 3 (GND) -> GND COMBOX (або альтернативна заводська пара Pin 8 (B) / Pin 7 (A) / Pin 6 (GND)).
 - **Офіційна карта регістрів (39 Holding Registers):**
   - `0000` (байти 3-4): Напруга пака (10 мВ, наприклад `0x133F` = 49.27 В).
-  - `0001` (байти 5-6): Струм пака (10 мА, >0 розряд, <0 заряд).
+  - `0001` (байти 5-6): Струм пака (10 мА, >0 заряд, <0 розряд).
   - `0002..0017` (байти 7..38): Напруги 16 комірок (мВ, для 15S комірка 16 = 0 мВ).
   - `0018` (байти 39-40): Temp of PCB (23 °C).
   - `0019` (байти 41-42): Temp Avg (22 °C) — транслюється в Pylontech 0x356.

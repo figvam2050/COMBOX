@@ -54,7 +54,8 @@ static const uint8_t moduleAddresses[MAX_BATTERIES] = {0x01, 0x02, 0x03, 0x04};
 
 // Set to true to poll only MASTER_ADDRESS (0x10).
 // Set to false to scan addresses 0x01..0x04 sequentially.
-static constexpr bool USE_MASTER_ONLY = true;
+// Controlled automatically by physical DIP switches (DIP 0 = Master only).
+static bool useMasterOnly = true;
 
 // Vision register map request: 39 holding registers (0x0000 .. 0x0026)
 static constexpr uint16_t BMS_START_REGISTER = 0x0000;
@@ -102,7 +103,7 @@ struct BatteryTelemetry {
   uint8_t address = 0;
 
   uint16_t totalVoltageRaw = 0; // 10 mV units (e.g. 4927 = 49.27 V)
-  int16_t currentRaw = 0;       // 10 mA units (Discharge > 0, Charge < 0 per Vision doc)
+  int16_t currentRaw = 0;       // 10 mA units (Charge > 0, Discharge < 0 per Vision spec)
   uint16_t cellVoltages[16] = {0};
 
   int16_t tempPCB = 0;          // °C (Reg 18: Temp of PCB)
@@ -254,13 +255,27 @@ bool initCAN_500k() {
       return false;
   }
 
-  // APB1 = 32 MHz with standard Arduino STM32F1 HSI PLL (64MHz SYSCLK / 2 = 32MHz APB1)
-  // 32 MHz / (Prescaler 4 * 16 TQ) = 500 kbit/s
-  // SJW = 2 TQ (1U << 24)
-  // TS2 = 4 TQ (3U << 20)
-  // TS1 = 11 TQ (10U << 16)
-  // BRP = 4 (prescaler = 3U + 1)
-  CAN1->BTR = (1U << 24) | (3U << 20) | (10U << 16) | 3U;
+  // Dynamic baudrate configuration for 500 kbit/s based on APB1 peripheral clock
+  uint32_t pclk1 = HAL_RCC_GetPCLK1Freq();
+  if (pclk1 == 36000000UL) {
+    // 36 MHz (standard 8MHz HSE * 9 / 2):
+    // Prescaler = 4, Total TQ = 18 (Sync 1 + TS1 13 + TS2 4), SJW = 2
+    // Sample point = (1 + 13) / 18 = 77.8% (CiA standard recommendation)
+    // 36 MHz / (4 * 18) = 500.000 kbit/s (0.00% error)
+    CAN1->BTR = (1U << 24) | (3U << 20) | (12U << 16) | 3U;
+  } else if (pclk1 == 32000000UL) {
+    // 32 MHz (HSI 64MHz / 2):
+    // Prescaler = 4, Total TQ = 16 (Sync 1 + TS1 11 + TS2 4), SJW = 2
+    // Sample point = (1 + 11) / 16 = 75.0%
+    // 32 MHz / (4 * 16) = 500.000 kbit/s (0.00% error)
+    CAN1->BTR = (1U << 24) | (3U << 20) | (10U << 16) | 3U;
+  } else if (pclk1 == 24000000UL) {
+    // 24 MHz: Prescaler = 3, Total TQ = 16 (Sync 1 + TS1 11 + TS2 4), SJW = 2
+    CAN1->BTR = (1U << 24) | (3U << 20) | (10U << 16) | 2U;
+  } else {
+    // Generic fallback for 36 MHz:
+    CAN1->BTR = (1U << 24) | (3U << 20) | (12U << 16) | 3U;
+  }
 
   // Auto bus-off recovery enabled, automatic retransmission enabled
   CAN1->MCR |= CAN_MCR_ABOM;
@@ -464,11 +479,40 @@ bool dischargeAllowedByProtection(uint16_t p) {
 
 void buildFrame359(uint16_t warning, uint16_t protection, uint8_t out[8]) {
   memset(out, 0, 8);
-  if (protection != 0)
-    out[0] = 0x01; // generic protection active
-  if (warning != 0)
-    out[2] = 0x01; // generic warning active
-  out[4] = 0x01;   // module count
+
+  // Byte 0: Protection / Alarm flags per Pylontech CAN standard
+  if (protection & (PROT_DISCHARGE_OC | PROT_DISCHARGE_SC))
+    out[0] |= 0x01; // Bit 0: Discharge High Current Protection
+  if (protection & PROT_CHARGE_OC)
+    out[0] |= 0x02; // Bit 1: Charge High Current Protection
+  if (protection & (PROT_CHARGE_OT | PROT_DISCHARGE_OT | PROT_MOS_TEMP | PROT_ENV_TEMP))
+    out[0] |= 0x04; // Bit 2: High Temperature Protection
+  if (protection & (PROT_CHARGE_UT | PROT_DISCHARGE_UT))
+    out[0] |= 0x08; // Bit 3: Low Temperature Protection
+  if (protection & (PROT_PACK_UV | PROT_CELL_UV))
+    out[0] |= 0x10; // Bit 4: Under Voltage Protection
+  if (protection & (PROT_PACK_OV | PROT_CELL_OV))
+    out[0] |= 0x20; // Bit 5: Over Voltage Protection
+  if (protection & PROT_LOW_CAPACITY)
+    out[0] |= 0x80; // Bit 7: System / Capacity Fault
+
+  // Byte 2: Warning flags per Pylontech CAN standard
+  if (warning & (PROT_DISCHARGE_OC | PROT_DISCHARGE_SC))
+    out[2] |= 0x01; // Bit 0: Discharge Current Warning
+  if (warning & PROT_CHARGE_OC)
+    out[2] |= 0x02; // Bit 1: Charge Current Warning
+  if (warning & (PROT_CHARGE_OT | PROT_DISCHARGE_OT | PROT_MOS_TEMP | PROT_ENV_TEMP))
+    out[2] |= 0x04; // Bit 2: High Temperature Warning
+  if (warning & (PROT_CHARGE_UT | PROT_DISCHARGE_UT))
+    out[2] |= 0x08; // Bit 3: Low Temperature Warning
+  if (warning & (PROT_PACK_UV | PROT_CELL_UV))
+    out[2] |= 0x10; // Bit 4: Low Voltage Warning
+  if (warning & (PROT_PACK_OV | PROT_CELL_OV))
+    out[2] |= 0x20; // Bit 5: High Voltage Warning
+  if (warning & PROT_LOW_CAPACITY)
+    out[2] |= 0x80; // Bit 7: Low Capacity Warning
+
+  out[4] = 0x01;   // Module count (Master)
   out[6] = 'P';
   out[7] = 'N';
 }
@@ -516,7 +560,7 @@ void sendDeyeCanFrames() {
     if (bmsChargeA == 0 || bmsChargeA > SYSTEM_MAX_CHARGE_A)
       bmsChargeA = SYSTEM_MAX_CHARGE_A;
 
-    if (USE_MASTER_ONLY) {
+    if (useMasterOnly) {
       chargeLimitA = bmsChargeA;
       dischargeLimitA = SYSTEM_MAX_DISCHARGE_A;
     } else {
@@ -533,11 +577,11 @@ void sendDeyeCanFrames() {
   uint16_t soc = (uint16_t)(sumSoc / validCount);
   uint16_t soh = (uint16_t)(sumSoh / validCount);
 
-  // CURRENT SIGN CONVERSION:
-  // Vision BMS: 10 mA, discharge > 0, charge < 0.
-  // Pylontech CAN 0x356: 0.1 A, charge > 0, discharge < 0.
-  // We divide by 10 and invert sign:
-  int32_t current01A32 = - (totalCurrentRaw / 10);
+  // CURRENT CONVERSION:
+  // Vision BMS: 10 mA units, charge > 0, discharge < 0 per official specification.
+  // Pylontech CAN 0x356: 0.1 A units, signed int16, charge > 0, discharge < 0.
+  // Total current in 10mA divided by 10 to get 0.1A units (no sign inversion):
+  int32_t current01A32 = totalCurrentRaw / 10;
   if (current01A32 > 32767)
     current01A32 = 32767;
   if (current01A32 < -32768)
@@ -588,12 +632,15 @@ void sendDeyeCanFrames() {
                      (uint8_t)((uint16_t)avgTemp01C & 0xFF),
                      (uint8_t)(((uint16_t)avgTemp01C >> 8) & 0xFF)};
 
-  // Frame 0x35C: Operation permissions (Byte 0: Bit 7=Charge enable, Bit 6=Discharge enable)
+  // Frame 0x35C: Operation permissions
+  // Byte 0: Bit 7=Charge enable (0x80), Bit 6=Discharge enable (0x40), Bit 5=Force charge request (0x20)
   uint8_t d35C[8] = {0};
   if (chargeEnable)
     d35C[0] |= 0x80;
   if (dischargeEnable)
     d35C[0] |= 0x40;
+  if (soc <= 5)
+    d35C[0] |= 0x20; // Request immediate charge from inverter when battery is critically low
 
   // Frame 0x35E: Manufacturer ASCII
   uint8_t d35E[8] = {'P', 'Y', 'L', 'O', 'N', ' ', ' ', ' '};
@@ -635,13 +682,13 @@ uint8_t currentBatteryIndex = 0;
 uint8_t currentExpectedAddress = MASTER_ADDRESS;
 
 uint8_t getAddressForSlot(uint8_t slot) {
-  if (USE_MASTER_ONLY)
+  if (useMasterOnly)
     return MASTER_ADDRESS;
   return moduleAddresses[slot];
 }
 
 uint8_t activeSlotCount() {
-  return USE_MASTER_ONLY ? 1 : MAX_BATTERIES;
+  return useMasterOnly ? 1 : MAX_BATTERIES;
 }
 
 // -----------------------------------------------------------------------------
@@ -655,6 +702,11 @@ void setup() {
   pinMode(PB13, INPUT_PULLUP);
   pinMode(PB14, INPUT_PULLUP);
   pinMode(PB15, INPUT_PULLUP);
+
+  uint8_t dip = readFactoryDipAddress();
+  // If DIP == 0 (all switches OFF): default Master-only mode (address 0x10)
+  // If DIP > 0: multi-module scan mode (addresses 0x01..0x04)
+  useMasterOnly = (dip == 0);
 
   // Indicators (PB0, PB1, PC5, PC13)
   pinMode(PIN_LED_RUN, OUTPUT);
