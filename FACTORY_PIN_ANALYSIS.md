@@ -84,9 +84,10 @@ direction control. A continuity measurement from the transceiver-side `DE` and
 - The new image is standalone at `0x08000000`; the original factory
   bootloader/application split is not reused.
 
-## Remaining live tests
+## Confirmed Live BMS Communication
 
-Static analysis determines MCU usage, but it cannot verify the cable pinout,
-RS485 A/B polarity, electrical direction timing, or whether Vision address
-`0x10` returns the expected 39-register map. Verify those items with an
-oscilloscope or logic analyzer before connecting the inverter under load.
+Натурні випробування утилітою `BMS_TOOLS_2.2.01` на реальній батареї Vision підтвердили:
+- Опитування здійснюється за адресою **`0x10`**: `10 03 00 00 00 27 06 91`.
+- Батарея повертає валідну 83-байтну відповідь: `10 03 4E 13 3F 00 00 ...` (39 регістрів починаючи з `0x0000`).
+- Отримані дані валідні: напруга 49.27 В, струм 0 А, 15 комірок по ~3.28 В, 100% SOC / SOH.
+- Повні результати схемотехніки та розпіновки закріплені в еталонному документі `PORT_MAPPING.md`.
