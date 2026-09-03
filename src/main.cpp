@@ -105,14 +105,18 @@ struct BatteryTelemetry {
   int16_t currentRaw = 0;       // 10 mA units (Discharge > 0, Charge < 0 per Vision doc)
   uint16_t cellVoltages[16] = {0};
 
-  int16_t tempPCB = 0;          // °C
-  int16_t tempAvg = 0;          // °C
+  int16_t tempPCB = 0;          // °C (Reg 18: MOS/PCB)
+  int16_t tempCell1 = 0;        // °C (Reg 19: Cell 1)
+  int16_t tempCell2 = 0;        // °C (Reg 20: Cell 2)
+  int16_t tempEnv = 0;          // °C (Reg 21: Ambient)
+  int16_t tempAvg = 0;          // °C (Average cell temp for CAN 0x356)
   int16_t tempMax = 0;          // °C
 
+  uint16_t soc = 0;             // % (0..100, Reg 22)
+  uint16_t soh = 0;             // % (0..100, Reg 23)
+  uint16_t cycleCount = 0;      // (Reg 24)
   uint16_t remainCapRaw = 0;
-  uint16_t maxChargeCurrentRaw = 0;
-  uint16_t soh = 0;             // % (0..100)
-  uint16_t soc = 0;             // % (0..100)
+  uint16_t maxChargeCurrentRaw = 0; // A (from Reg 37 or fallback)
 
   uint16_t status = 0;
   uint16_t warning = 0;
@@ -406,18 +410,30 @@ bool parseBmsResponse(const uint8_t *buf, uint16_t len, uint8_t expectedAddress,
   for (uint8_t i = 0; i < 16; i++)
     bat.cellVoltages[i] = be16(&buf[7 + i * 2]);
 
-  // Registers 18..20: Temperatures (°C)
+  // Registers 18..20: Temperatures (°C) per official protocol table
+  // Reg 18 (byte 39): Temp of PCB
   bat.tempPCB = be16s(&buf[39]);
+  // Reg 19 (byte 41): Temp Avg
   bat.tempAvg = be16s(&buf[41]);
+  // Reg 20 (byte 43): Temp Max
   bat.tempMax = be16s(&buf[43]);
 
-  // Registers 21..24
+  // Registers 21..24 per official protocol table:
+  // Reg 21 (byte 45): Cap Remaining (Ah)
   bat.remainCapRaw = be16(&buf[45]);
+  // Reg 22 (byte 47): Max charging Current (A)
   bat.maxChargeCurrentRaw = be16(&buf[47]);
+  // Reg 23 (byte 49): State of Health (SOH 0-100%)
   bat.soh = be16(&buf[49]);
+  // Reg 24 (byte 51): State of Charge (SOC 0-100%)
   bat.soc = be16(&buf[51]);
 
-  // Registers 25..27
+  // Fallback for maxChargeCurrentRaw if uninitialized by BMS
+  if (bat.maxChargeCurrentRaw == 0 || bat.maxChargeCurrentRaw > SYSTEM_MAX_CHARGE_A) {
+    bat.maxChargeCurrentRaw = SYSTEM_MAX_CHARGE_A;
+  }
+
+  // Registers 25..27: Status / Warnings / Protection
   bat.status = be16(&buf[53]);
   bat.warning = be16(&buf[55]);
   bat.protection = be16(&buf[57]);
