@@ -31,6 +31,10 @@ value = (!PB15 * 8) + (!PB14 * 4) + (!PB13 * 2) + (!PB12 * 1)
 ```
 
 The factory application converts DIP value 0 to communication address `0x10`.
+This is evidence about the original Felicity firmware, not the configured
+address of the connected Vision BMS. A later live Modbus RTU test established
+that the Vision BMS used by this project responds at `0x04`; the standalone
+firmware therefore uses `0x04` as its single-BMS default.
 
 ## Indicators
 
@@ -84,11 +88,18 @@ direction control. A continuity measurement from the transceiver-side `DE` and
 - The new image is standalone at `0x08000000`; the original factory
   bootloader/application split is not reused.
 
-## Confirmed Live BMS Communication (Official Vision MODbus Protocol V01.01)
+## Historical and Current BMS Communication Evidence
  
-Документ `MODbus Communication Protocol_15-16S-1.pdf` та натурні випробування з `BMS_TOOLS_2.2.01` підтвердили:
-- Опитування здійснюється за адресою **`0x10`** (Master BMS): `10 03 00 00 00 27 06 91` (39 регістрів).
-- Батарея повертає 83 байти даних: `10 03 4E 13 3F 00 00 ...` (49.27 В, 31% SOC, 100% SOH).
+Документ `MODbus Communication Protocol_15-16S-1.pdf` та раннє натурне випробування з `BMS_TOOLS_2.2.01` зафіксували:
+- Історичний кадр заводського середовища за адресою **`0x10`**: `10 03 00 00 00 27 06 91` (39 регістрів).
+- Батарея в тому записі повернула 83 байти: `10 03 4E 13 3F 00 00 ...` (49.27 В, 31% SOC, 100% SOH).
+
+Поточне підключення Vision BMS було повторно перевірене через ModMaster на macOS:
+- Робоча Modbus-адреса: **`0x04`**.
+- Запит 39 регістрів: `04 03 00 00 00 27 05 85`.
+- Саме цю адресу використовує standalone-прошивка `src/main.cpp`.
+
+Для обох записів застосовується одна карта регістрів:
 - **Офіційна карта регістрів:**
   - `0000`: Напруга 49.27 В (10 мВ)
   - `0001`: Струм 0.00 А (10 мА, >0 розряд, <0 заряд)

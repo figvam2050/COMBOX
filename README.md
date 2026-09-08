@@ -12,7 +12,8 @@
 - `PORT_MAPPING.md` - **ЕТАЛОННИЙ ДОКУМЕНТ** апаратної продзвонки та розпіновки плати (зміни заборонені)
 - `platformio.ini` - PlatformIO configuration
 - `GD32F305RC_COMBOX.ld` - Linker script for standalone firmware at flash base
-- `src/main.cpp` - Application logic (BMS Modbus RTU -> Deye Pylontech CAN)
+- `src/main.cpp` - Application logic (Vision Modbus RTU -> Deye LV-CAN)
+- `DEYE_CAN_PROTOCOL.md` - Підтверджений формат кадрів Deye LV-CAN та правила безпечної трансляції
 - `FACTORY_PIN_ANALYSIS.md` - Аналіз заводської прошивки та реверс-інжиніринг
 - `FLASHING_INSTRUCTIONS.md` - Детальна інструкція з прошивки через ST-Link
 
@@ -33,10 +34,12 @@ The MCU on the board is **GD32F305RCT6**. We use the `genericSTM32F103RC` Platfo
   - `PC5` (`LED6` PCS-CAN Connect): Імпульс 40 мс при відправці CAN-кадрів інвертору.
   - `PC13` (`LED5` PCS-485 Connect): Вимкнено (LOW).
 - **DIP-перемикач:** `PB12` (1), `PB13` (2), `PB14` (4), `PB15` (8), active-low з pull-up.
+  - У цій прошивці всі DIP у положенні `OFF` означають один підключений BMS за адресою `0x04`.
+  - Будь-яке інше значення DIP вмикає послідовне сканування адрес `0x01..0x04`.
 
 ## Verified BMS Communication (Official Vision MODbus Protocol V01.01)
 - Документовано в офіційній специфікації `MODbus Communication Protocol_15-16S-1.pdf`:
-  - **Запит:** `10 03 00 00 00 27 06 91` (Master Address `0x10`, Read 39 registers from `0x0000`).
+  - **Підтверджений живим тестом запит:** `04 03 00 00 00 27 05 85` (BMS адреса `0x04`, читання 39 регістрів від `0x0000`).
   - **Швидкість:** 9600 бод (Default), інтервал читання 300 мс.
   - **Кабель до АКБ (RJ45 Vision BMS):** Pin 1 (RS485-B) -> B COMBOX, Pin 2 (RS485-A) -> A COMBOX, Pin 3 (GND) -> GND COMBOX (або альтернативна заводська пара Pin 8 (B) / Pin 7 (A) / Pin 6 (GND)).
 - **Офіційна карта регістрів (39 Holding Registers):**
@@ -44,7 +47,7 @@ The MCU on the board is **GD32F305RCT6**. We use the `genericSTM32F103RC` Platfo
   - `0001` (байти 5-6): Струм пака (10 мА, >0 заряд, <0 розряд).
   - `0002..0017` (байти 7..38): Напруги 16 комірок (мВ, для 15S комірка 16 = 0 мВ).
   - `0018` (байти 39-40): Temp of PCB (23 °C).
-  - `0019` (байти 41-42): Temp Avg (22 °C) — транслюється в Pylontech 0x356.
+  - `0019` (байти 41-42): Temp Avg (22 °C) — транслюється в Deye 0x356.
   - `0020` (байти 43-44): Temp Max (22 °C).
   - `0021` (байти 45-46): Cap Remaining (`0x000F` = 15 Ah).
   - `0022` (байти 47-48): Max charging Current (`0x0064` = 100 A).
@@ -53,6 +56,14 @@ The MCU on the board is **GD32F305RCT6**. We use the `genericSTM32F103RC` Platfo
   - `0025..0027` (байти 53..58): Status, Warning, Protection прапорці.
   - `0036` (байти 71-72): Cell Num (`0x000F` = 15 комірок).
   - `0037` (байти 73-74): Designed Capacity (`0x03E8` = 1000 -> 100.0 Ah).
+
+## Deye LV-CAN
+- Фізичний інтерфейс: `PB8` RX, `PB9` TX, 500 кбіт/с, standard CAN 2.0A (11-bit ID), `DLC=8`.
+- Прошивка передає раз на 500 мс кадри `0x351`, `0x355`, `0x356`, `0x35C` у little-endian форматі.
+- Також приймається запит інвертора `0x305`; після нього COMBOX надсилає актуальний набір кадрів без очікування наступного таймера.
+- Кадри `0x359`, `0x35A` та `0x35E` свідомо не передаються: для обраного профілю `LiBms: Deye` у проаналізованій MCU1-прошивці вони не потрібні для базового обміну.
+- Якщо BMS не відповідає понад 5 с, CAN-кадри продовжують виходити, але з нульовими напругами та лімітами. Це блокує заряд/розряд і не залишає інвертору застарілих показників.
+- Деталі полів, масштабів та приклади пакетів: `DEYE_CAN_PROTOCOL.md`.
 
 ## Build Artifacts
 - A successful PlatformIO build automatically copies `firmware.bin` and `firmware.hex` to the `compiled_firmware/` directory.

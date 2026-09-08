@@ -5,7 +5,7 @@
 #include <Arduino.h>
 
 /*
-  Vision V-LFP48100 -> Felicity COM-Box hardware -> Deye CAN/Pylontech
+  Vision V-LFP48100 -> Felicity COM-Box hardware -> Deye LV-CAN
   Target: GD32F305RCT6 on Felicity "BMS COM BOX" PCB
   Compiled with PlatformIO: board genericSTM32F103RC, framework arduino
 
@@ -47,14 +47,15 @@
 // -----------------------------------------------------------------------------
 #define MAX_BATTERIES 4
 
-// Factory default / Vision single pack address confirmed by live BMS_TOOLS capture:
-// "10 03 00 00 00 27 06 91" -> "10 03 4E 13 3F ..."
-static constexpr uint8_t MASTER_ADDRESS = 0x10;
+// The connected Vision BMS was verified live at Modbus RTU address 0x04:
+// "04 03 00 00 00 27 05 85". An older factory COM-Box capture at 0x10
+// is historical data and must not be used for this battery.
+static constexpr uint8_t MASTER_ADDRESS = 0x04;
 static const uint8_t moduleAddresses[MAX_BATTERIES] = {0x01, 0x02, 0x03, 0x04};
 
-// Set to true to poll only MASTER_ADDRESS (0x10).
+// Set to true to poll only MASTER_ADDRESS (0x04).
 // Set to false to scan addresses 0x01..0x04 sequentially.
-// Controlled automatically by physical DIP switches (DIP 0 = Master only).
+// Controlled automatically by physical DIP switches (DIP 0 = single BMS).
 static bool useMasterOnly = true;
 
 // Vision register map request: 39 holding registers (0x0000 .. 0x0026)
@@ -66,14 +67,14 @@ static constexpr uint16_t BMS_RESPONSE_LEN   = 83;     // 1(addr) + 1(func) + 1(
 static constexpr uint32_t BMS_POLL_INTERVAL_MS   = 300;   // Poll BMS every 300ms
 static constexpr uint32_t BMS_RESPONSE_TIMEOUT_MS = 150;  // 150ms timeout waiting for response
 static constexpr uint32_t BMS_STALE_MS           = 5000;  // Data considered stale after 5s
-static constexpr uint32_t CAN_PERIOD_MS          = 1000;  // Deye heartbeat every 1s
+static constexpr uint32_t CAN_PERIOD_MS          = 500;   // Deye LV-CAN update period
 static constexpr uint32_t LED_PULSE_DURATION_MS  = 40;    // 40ms pulse for clear visibility
 
 // Conservative system safety limits for Deye low-voltage 48V/51.2V
 static constexpr uint16_t SYSTEM_MAX_CHARGE_A    = 100;
 static constexpr uint16_t SYSTEM_MAX_DISCHARGE_A = 120;
 
-// Voltage limits in 0.1V units for Pylontech CAN frame 0x351
+// Voltage limits in 0.1V units for Deye LV-CAN frame 0x351
 // 54.0V charge cutoff, 43.0V discharge cutoff (matches 15S/16S LFP safety curve)
 static constexpr uint16_t CHARGE_VOLTAGE_LIMIT_01V    = 540; // 54.0 V
 static constexpr uint16_t DISCHARGE_VOLTAGE_LIMIT_01V = 430; // 43.0 V
@@ -367,6 +368,57 @@ bool sendCANMessage(uint16_t id, const uint8_t *data, uint8_t len,
   return false;
 }
 
+struct CanRxFrame {
+  uint16_t id = 0;
+  uint8_t data[8] = {0};
+  uint8_t len = 0;
+};
+
+// Read one FIFO0 message and always release it. Deye uses standard data frames
+// here, so remote or extended frames are intentionally ignored after release.
+bool receiveStandardCanMessage(CanRxFrame &frame) {
+  if ((CAN1->RF0R & 0x03UL) == 0)
+    return false;
+
+  CAN_FIFOMailBox_TypeDef &mb = CAN1->sFIFOMailBox[0];
+  const uint32_t rir = mb.RIR;
+  const uint32_t rdtr = mb.RDTR;
+  const uint32_t rdlr = mb.RDLR;
+  const uint32_t rdhr = mb.RDHR;
+
+  // RFOM0 releases FIFO0. It must happen even for an unsupported frame.
+  CAN1->RF0R |= (1UL << 5);
+
+  // IDE bit 2 and RTR bit 1 must both be clear for a standard data frame.
+  if ((rir & 0x06UL) != 0)
+    return false;
+
+  frame.id = (uint16_t)(rir >> 21);
+  frame.len = (uint8_t)(rdtr & 0x0FUL);
+  for (uint8_t i = 0; i < 4; i++)
+    frame.data[i] = (uint8_t)(rdlr >> (8U * i));
+  for (uint8_t i = 0; i < 4; i++)
+    frame.data[i + 4] = (uint8_t)(rdhr >> (8U * i));
+  return true;
+}
+
+bool deyePollRequested = false;
+
+void processDeyeCanRequests() {
+  // Drain a bounded number of frames so CAN reception cannot starve BMS polling.
+  for (uint8_t count = 0; count < 4 && (CAN1->RF0R & 0x03UL) != 0; count++) {
+    CanRxFrame frame;
+    if (!receiveStandardCanMessage(frame))
+      continue;
+
+    // Deye periodically emits 0x305 with eight zero bytes. The normal cyclic
+    // update remains active; this flag lets the bridge answer a fresh request
+    // without waiting for the next 500 ms timer tick.
+    if (frame.id == 0x305 && frame.len == 8)
+      deyePollRequested = true;
+  }
+}
+
 // -----------------------------------------------------------------------------
 // RS485 MODBUS REQUEST (Function 0x03, 39 registers from 0x0000)
 // -----------------------------------------------------------------------------
@@ -414,7 +466,7 @@ bool parseBmsResponse(const uint8_t *buf, uint16_t len, uint8_t expectedAddress,
 
   // Register 0: Total Voltage (10 mV = 0.01 V)
   bat.totalVoltageRaw = be16(&buf[3]);
-  // Register 1: Current (10 mA, signed: >0 discharge, <0 charge)
+  // Register 1: Current (10 mA, signed: >0 charge, <0 discharge)
   bat.currentRaw = be16s(&buf[5]);
 
   // Registers 2..17: Cell voltages 1..16 (mV)
@@ -477,48 +529,8 @@ bool dischargeAllowedByProtection(uint16_t p) {
   return (p & deny) == 0;
 }
 
-void buildFrame359(uint16_t warning, uint16_t protection, uint8_t out[8]) {
-  memset(out, 0, 8);
-
-  // Byte 0: Protection / Alarm flags per Pylontech CAN standard
-  if (protection & (PROT_DISCHARGE_OC | PROT_DISCHARGE_SC))
-    out[0] |= 0x01; // Bit 0: Discharge High Current Protection
-  if (protection & PROT_CHARGE_OC)
-    out[0] |= 0x02; // Bit 1: Charge High Current Protection
-  if (protection & (PROT_CHARGE_OT | PROT_DISCHARGE_OT | PROT_MOS_TEMP | PROT_ENV_TEMP))
-    out[0] |= 0x04; // Bit 2: High Temperature Protection
-  if (protection & (PROT_CHARGE_UT | PROT_DISCHARGE_UT))
-    out[0] |= 0x08; // Bit 3: Low Temperature Protection
-  if (protection & (PROT_PACK_UV | PROT_CELL_UV))
-    out[0] |= 0x10; // Bit 4: Under Voltage Protection
-  if (protection & (PROT_PACK_OV | PROT_CELL_OV))
-    out[0] |= 0x20; // Bit 5: Over Voltage Protection
-  if (protection & PROT_LOW_CAPACITY)
-    out[0] |= 0x80; // Bit 7: System / Capacity Fault
-
-  // Byte 2: Warning flags per Pylontech CAN standard
-  if (warning & (PROT_DISCHARGE_OC | PROT_DISCHARGE_SC))
-    out[2] |= 0x01; // Bit 0: Discharge Current Warning
-  if (warning & PROT_CHARGE_OC)
-    out[2] |= 0x02; // Bit 1: Charge Current Warning
-  if (warning & (PROT_CHARGE_OT | PROT_DISCHARGE_OT | PROT_MOS_TEMP | PROT_ENV_TEMP))
-    out[2] |= 0x04; // Bit 2: High Temperature Warning
-  if (warning & (PROT_CHARGE_UT | PROT_DISCHARGE_UT))
-    out[2] |= 0x08; // Bit 3: Low Temperature Warning
-  if (warning & (PROT_PACK_UV | PROT_CELL_UV))
-    out[2] |= 0x10; // Bit 4: Low Voltage Warning
-  if (warning & (PROT_PACK_OV | PROT_CELL_OV))
-    out[2] |= 0x20; // Bit 5: High Voltage Warning
-  if (warning & PROT_LOW_CAPACITY)
-    out[2] |= 0x80; // Bit 7: Low Capacity Warning
-
-  out[4] = 0x01;   // Module count (Master)
-  out[6] = 'P';
-  out[7] = 'N';
-}
-
 // -----------------------------------------------------------------------------
-// AGGREGATE + SEND PYLONTECH CAN FRAMES TO DEYE
+// AGGREGATE + SEND DEYE LV-CAN FRAMES
 // -----------------------------------------------------------------------------
 void sendDeyeCanFrames() {
   uint8_t validCount = 0;
@@ -531,9 +543,6 @@ void sendDeyeCanFrames() {
 
   uint32_t chargeLimitA = 0;
   uint32_t dischargeLimitA = 0;
-
-  uint16_t warningOR = 0;
-  uint16_t protectionOR = 0;
 
   bool chargeEnable = true;
   bool dischargeEnable = true;
@@ -549,9 +558,6 @@ void sendDeyeCanFrames() {
     sumVoltage += b.totalVoltageRaw;
     totalCurrentRaw += b.currentRaw;
     sumTemp += b.tempAvg;
-
-    warningOR |= b.warning;
-    protectionOR |= b.protection;
 
     chargeEnable &= chargeAllowedByProtection(b.protection);
     dischargeEnable &= dischargeAllowedByProtection(b.protection);
@@ -569,24 +575,33 @@ void sendDeyeCanFrames() {
     }
   }
 
-  if (validCount == 0)
-    return;
+  const bool haveValidData = validCount != 0;
+  uint16_t avgVoltage001V = 0;
+  int16_t avgTemp01C = 0;
+  uint16_t soc = 0;
+  uint16_t soh = 0;
+  int16_t current01A = 0;
 
-  uint16_t avgVoltage001V = (uint16_t)(sumVoltage / validCount);
-  int16_t avgTemp01C = (int16_t)((sumTemp / (int32_t)validCount) * 10);
-  uint16_t soc = (uint16_t)(sumSoc / validCount);
-  uint16_t soh = (uint16_t)(sumSoh / validCount);
+  if (haveValidData) {
+    avgVoltage001V = (uint16_t)(sumVoltage / validCount);
+    avgTemp01C = (int16_t)((sumTemp / (int32_t)validCount) * 10);
+    soc = (uint16_t)(sumSoc / validCount);
+    soh = (uint16_t)(sumSoh / validCount);
 
-  // CURRENT CONVERSION:
-  // Vision BMS: 10 mA units, charge > 0, discharge < 0 per official specification.
-  // Pylontech CAN 0x356: 0.1 A units, signed int16, charge > 0, discharge < 0.
-  // Total current in 10mA divided by 10 to get 0.1A units (no sign inversion):
-  int32_t current01A32 = totalCurrentRaw / 10;
-  if (current01A32 > 32767)
-    current01A32 = 32767;
-  if (current01A32 < -32768)
-    current01A32 = -32768;
-  int16_t current01A = (int16_t)current01A32;
+    // Vision and Deye use the same sign convention: charge is positive and
+    // discharge is negative. Convert 10 mA units to 0.1 A without inversion.
+    int32_t current01A32 = totalCurrentRaw / 10;
+    if (current01A32 > 32767)
+      current01A32 = 32767;
+    if (current01A32 < -32768)
+      current01A32 = -32768;
+    current01A = (int16_t)current01A32;
+  } else {
+    // Continue sending valid CAN frames with zero limits after a BMS timeout.
+    // This prevents the inverter from acting on stale measurements.
+    chargeEnable = false;
+    dischargeEnable = false;
+  }
 
   // Dynamic high-SOC taper to protect battery top end
   if (soc >= 99) {
@@ -602,56 +617,48 @@ void sendDeyeCanFrames() {
   if (!dischargeEnable)
     dischargeLimitA = 0;
 
-  // Pylon 0x351 current units = 0.1 A
+  // Deye 0x351 current units = 0.1 A.
   uint16_t chargeLimit01A = clampU16(chargeLimitA * 10U, 65000);
   uint16_t dischargeLimit01A = clampU16(dischargeLimitA * 10U, 65000);
 
-  // Frame 0x359: Alarms / Warnings
-  uint8_t d359[8];
-  buildFrame359(warningOR, protectionOR, d359);
-
   // Frame 0x351: CVL, CCL, DCL, DVL (0.1 V and 0.1 A)
-  uint8_t d351[8] = {(uint8_t)(CHARGE_VOLTAGE_LIMIT_01V & 0xFF),
-                     (uint8_t)(CHARGE_VOLTAGE_LIMIT_01V >> 8),
+  const uint16_t chargeVoltageLimit = haveValidData ? CHARGE_VOLTAGE_LIMIT_01V : 0;
+  const uint16_t dischargeVoltageLimit = haveValidData ? DISCHARGE_VOLTAGE_LIMIT_01V : 0;
+  uint8_t d351[8] = {(uint8_t)(chargeVoltageLimit & 0xFF),
+                     (uint8_t)(chargeVoltageLimit >> 8),
                      (uint8_t)(chargeLimit01A & 0xFF),
                      (uint8_t)(chargeLimit01A >> 8),
                      (uint8_t)(dischargeLimit01A & 0xFF),
                      (uint8_t)(dischargeLimit01A >> 8),
-                     (uint8_t)(DISCHARGE_VOLTAGE_LIMIT_01V & 0xFF),
-                     (uint8_t)(DISCHARGE_VOLTAGE_LIMIT_01V >> 8)};
+                     (uint8_t)(dischargeVoltageLimit & 0xFF),
+                     (uint8_t)(dischargeVoltageLimit >> 8)};
 
   // Frame 0x355: SOC, SOH (uint16 LE)
-  uint8_t d355[4] = {(uint8_t)(soc & 0xFF), (uint8_t)(soc >> 8),
-                     (uint8_t)(soh & 0xFF), (uint8_t)(soh >> 8)};
+  uint8_t d355[8] = {(uint8_t)(soc & 0xFF), (uint8_t)(soc >> 8),
+                     (uint8_t)(soh & 0xFF), (uint8_t)(soh >> 8),
+                     0, 0, 0, 0};
 
   // Frame 0x356: Voltage (0.01V LE), Current (0.1A signed LE), Temp (0.1°C signed LE)
-  uint8_t d356[6] = {(uint8_t)(avgVoltage001V & 0xFF),
+  uint8_t d356[8] = {(uint8_t)(avgVoltage001V & 0xFF),
                      (uint8_t)(avgVoltage001V >> 8),
                      (uint8_t)((uint16_t)current01A & 0xFF),
                      (uint8_t)(((uint16_t)current01A >> 8) & 0xFF),
                      (uint8_t)((uint16_t)avgTemp01C & 0xFF),
-                     (uint8_t)(((uint16_t)avgTemp01C >> 8) & 0xFF)};
+                     (uint8_t)(((uint16_t)avgTemp01C >> 8) & 0xFF),
+                     0, 0};
 
-  // Frame 0x35C: Operation permissions
-  // Byte 0: Bit 7=Charge enable (0x80), Bit 6=Discharge enable (0x40), Bit 5=Force charge request (0x20)
+  // Frame 0x35C: the Deye binary consumes only byte 0 bit 5 (0x20),
+  // a deliberate full/force-charge request. No such event is available in the
+  // Vision Modbus map, so keep every bit clear instead of guessing bit 6/7.
   uint8_t d35C[8] = {0};
-  if (chargeEnable)
-    d35C[0] |= 0x80;
-  if (dischargeEnable)
-    d35C[0] |= 0x40;
-  if (soc <= 5)
-    d35C[0] |= 0x20; // Request immediate charge from inverter when battery is critically low
-
-  // Frame 0x35E: Manufacturer ASCII
-  uint8_t d35E[8] = {'P', 'Y', 'L', 'O', 'N', ' ', ' ', ' '};
 
   const struct {
     uint16_t id;
     const uint8_t *data;
     uint8_t len;
   } frames[] = {
-      {0x351, d351, 8}, {0x355, d355, 4}, {0x356, d356, 6},
-      {0x359, d359, 8}, {0x35C, d35C, 8}, {0x35E, d35E, 8},
+      {0x351, d351, 8}, {0x355, d355, 8}, {0x356, d356, 8},
+      {0x35C, d35C, 8},
   };
 
   bool allOk = true;
@@ -704,7 +711,7 @@ void setup() {
   pinMode(PB15, INPUT_PULLUP);
 
   uint8_t dip = readFactoryDipAddress();
-  // If DIP == 0 (all switches OFF): default Master-only mode (address 0x10)
+  // If DIP == 0 (all switches OFF): single BMS mode (address 0x04)
   // If DIP > 0: multi-module scan mode (addresses 0x01..0x04)
   useMasterOnly = (dip == 0);
 
@@ -790,9 +797,14 @@ void loop() {
       bmsData[i].valid = false;
   }
 
-  // 3. Send Deye / Pylontech CAN periodically (1s heartbeat)
+  // 3. Read Deye's optional 0x305 poll request, then send Deye LV-CAN data.
+  if (canReady)
+    processDeyeCanRequests();
+
+  // The regular 500 ms update is required even if the inverter sends no poll.
   static uint32_t lastCanTime = 0;
-  if (canReady && now - lastCanTime >= CAN_PERIOD_MS) {
+  if (canReady && (deyePollRequested || now - lastCanTime >= CAN_PERIOD_MS)) {
+    deyePollRequested = false;
     lastCanTime = now;
     sendDeyeCanFrames();
   }

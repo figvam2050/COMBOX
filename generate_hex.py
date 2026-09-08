@@ -1,6 +1,7 @@
 Import("env")
 import os
 import shutil
+import zipfile
 
 def after_build(source, target, env):
     build_dir = env.subst("$BUILD_DIR")
@@ -13,7 +14,17 @@ def after_build(source, target, env):
     hex_file = os.path.join(build_dir, f"{progname}.hex")
 
     if os.path.exists(bin_file):
-        shutil.copy(bin_file, os.path.join(dest_dir, "firmware.bin"))
+        dest_bin = os.path.join(dest_dir, "firmware.bin")
+        shutil.copy(bin_file, dest_bin)
+
+        # Keep the distributable archive in sync with the binary. Opening in
+        # write mode replaces old entries and avoids macOS __MACOSX metadata.
+        with zipfile.ZipFile(
+            os.path.join(dest_dir, "firmware.bin.zip"),
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            archive.write(dest_bin, "firmware.bin")
     if os.path.exists(hex_file):
         # Keep the tracked Intel HEX portable and free of CRLF whitespace.
         with open(hex_file, "r", newline="") as source_file:
