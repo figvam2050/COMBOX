@@ -31,10 +31,10 @@ value = (!PB15 * 8) + (!PB14 * 4) + (!PB13 * 2) + (!PB12 * 1)
 ```
 
 The factory application converts DIP value 0 to communication address `0x10`.
-This is evidence about the original Felicity firmware, not the configured
-address of the connected Vision BMS. A later live Modbus RTU test established
-that the Vision BMS used by this project responds at `0x04`; the standalone
-firmware therefore uses `0x04` as its single-BMS default.
+The standalone firmware follows this useful address convention: DIP value `0`
+selects `0x10`, while values `1..15` select addresses `0x01..0x0F` directly.
+This covers both observed Vision BMS configurations, including the later live
+Modbus RTU capture at `0x04`.
 
 ## Indicators
 
@@ -97,7 +97,8 @@ direction control. A continuity measurement from the transceiver-side `DE` and
 Поточне підключення Vision BMS було повторно перевірене через ModMaster на macOS:
 - Робоча Modbus-адреса: **`0x04`**.
 - Запит 39 регістрів: `04 03 00 00 00 27 05 85`.
-- Саме цю адресу використовує standalone-прошивка `src/main.cpp`.
+- Цю адресу standalone-прошивка `src/main.cpp` використовує, коли DIP COMBOX
+  має значення `4`; значення DIP `0` лишає заводську адресу `0x10`.
 
 Для обох записів застосовується одна карта регістрів:
 - **Офіційна карта регістрів:**

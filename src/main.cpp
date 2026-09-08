@@ -47,16 +47,12 @@
 // -----------------------------------------------------------------------------
 #define MAX_BATTERIES 4
 
-// The connected Vision BMS was verified live at Modbus RTU address 0x04:
-// "04 03 00 00 00 27 05 85". An older factory COM-Box capture at 0x10
-// is historical data and must not be used for this battery.
-static constexpr uint8_t MASTER_ADDRESS = 0x04;
-static const uint8_t moduleAddresses[MAX_BATTERIES] = {0x01, 0x02, 0x03, 0x04};
-
-// Set to true to poll only MASTER_ADDRESS (0x04).
-// Set to false to scan addresses 0x01..0x04 sequentially.
-// Controlled automatically by physical DIP switches (DIP 0 = single BMS).
-static bool useMasterOnly = true;
+// The physical DIP selects the BMS Modbus address. This follows the original
+// COMBOX convention: zero maps to Pack 16 (0x10); values 1..15 map directly
+// to addresses 0x01..0x0F. It supports both observed Vision configurations:
+// 0x10 in BMS_TOOLS and 0x04 in the live ModMaster capture.
+static constexpr uint8_t FACTORY_DEFAULT_BMS_ADDRESS = 0x10;
+static uint8_t selectedBmsAddress = FACTORY_DEFAULT_BMS_ADDRESS;
 
 // Vision register map request: 39 holding registers (0x0000 .. 0x0026)
 static constexpr uint16_t BMS_START_REGISTER = 0x0000;
@@ -215,6 +211,7 @@ bool bmsUartAvailable() {
   // If Overrun / Noise / Framing error occurred, clear it by reading DR
   if (sr & (USART_SR_ORE | USART_SR_NE | USART_SR_FE)) {
     (void)COMBOX_BMS_USART->DR;
+    return false;
   }
   return (sr & USART_SR_RXNE) != 0;
 }
@@ -411,9 +408,9 @@ void processDeyeCanRequests() {
     if (!receiveStandardCanMessage(frame))
       continue;
 
-    // Deye periodically emits 0x305 with eight zero bytes. The normal cyclic
-    // update remains active; this flag lets the bridge answer a fresh request
-    // without waiting for the next 500 ms timer tick.
+    // Deye documents 0x305 as eight zero bytes. Its payload is not command
+    // data for COMBOX, so recognize any standard DLC-8 0x305 as a heartbeat
+    // and stay compatible with future inverter firmware revisions.
     if (frame.id == 0x305 && frame.len == 8)
       deyePollRequested = true;
   }
@@ -440,7 +437,8 @@ void sendBmsRequest(uint8_t address) {
   while (bmsUartAvailable())
     (void)bmsUartRead();
 
-  // Send request (board auto-direction switches from PA9 TX line)
+  // The original firmware has no runtime DE/RE pin. Keep the verified factory
+  // control levels and let the board's RS485 circuit handle direction.
   bmsUartWriteBuffer(req, sizeof(req));
   bmsUartFlush();
 }
@@ -491,8 +489,9 @@ bool parseBmsResponse(const uint8_t *buf, uint16_t len, uint8_t expectedAddress,
   // Reg 24 (byte 51): State of Charge (SOC 0-100%)
   bat.soc = be16(&buf[51]);
 
-  // Fallback for maxChargeCurrentRaw if uninitialized by BMS
-  if (bat.maxChargeCurrentRaw == 0 || bat.maxChargeCurrentRaw > SYSTEM_MAX_CHARGE_A) {
+  // A zero current limit is a valid BMS command to stop charging. Clamp only
+  // implausibly high values; never turn a BMS stop request into 100 A.
+  if (bat.maxChargeCurrentRaw > SYSTEM_MAX_CHARGE_A) {
     bat.maxChargeCurrentRaw = SYSTEM_MAX_CHARGE_A;
   }
 
@@ -563,16 +562,13 @@ void sendDeyeCanFrames() {
     dischargeEnable &= dischargeAllowedByProtection(b.protection);
 
     uint16_t bmsChargeA = b.maxChargeCurrentRaw;
-    if (bmsChargeA == 0 || bmsChargeA > SYSTEM_MAX_CHARGE_A)
+    // A zero limit is a valid BMS command to stop charging. Clamp only values
+    // above the system limit; never turn a BMS stop command into 100 A.
+    if (bmsChargeA > SYSTEM_MAX_CHARGE_A)
       bmsChargeA = SYSTEM_MAX_CHARGE_A;
 
-    if (useMasterOnly) {
-      chargeLimitA = bmsChargeA;
-      dischargeLimitA = SYSTEM_MAX_DISCHARGE_A;
-    } else {
-      chargeLimitA += bmsChargeA;
-      dischargeLimitA += SYSTEM_MAX_DISCHARGE_A;
-    }
+    chargeLimitA += bmsChargeA;
+    dischargeLimitA += SYSTEM_MAX_DISCHARGE_A;
   }
 
   const bool haveValidData = validCount != 0;
@@ -647,10 +643,14 @@ void sendDeyeCanFrames() {
                      (uint8_t)(((uint16_t)avgTemp01C >> 8) & 0xFF),
                      0, 0};
 
-  // Frame 0x35C: the Deye binary consumes only byte 0 bit 5 (0x20),
-  // a deliberate full/force-charge request. No such event is available in the
-  // Vision Modbus map, so keep every bit clear instead of guessing bit 6/7.
+  // Frame 0x35C: the Deye LV-CAN specification defines only byte 0 bit 5
+  // (0x20) as Full Charge Enable. Vision Modbus has no confirmed source for
+  // this request, so all bits stay clear; bits 6/7 are intentionally reserved.
   uint8_t d35C[8] = {0};
+
+  // Pylontech-compatible identity used by Deye LV-CAN profiles. This is an
+  // identifier only, not a claim that the Vision BMS is a Pylontech battery.
+  static const uint8_t d35E[8] = {'P', 'Y', 'L', 'O', 'N', ' ', ' ', ' '};
 
   const struct {
     uint16_t id;
@@ -658,7 +658,7 @@ void sendDeyeCanFrames() {
     uint8_t len;
   } frames[] = {
       {0x351, d351, 8}, {0x355, d355, 8}, {0x356, d356, 8},
-      {0x35C, d35C, 8},
+      {0x35C, d35C, 8}, {0x35E, d35E, 8},
   };
 
   bool allOk = true;
@@ -685,18 +685,7 @@ uint16_t rxIndex = 0;
 bool waitingForResponse = false;
 uint32_t responseStartTime = 0;
 uint32_t pollTimer = 0;
-uint8_t currentBatteryIndex = 0;
-uint8_t currentExpectedAddress = MASTER_ADDRESS;
-
-uint8_t getAddressForSlot(uint8_t slot) {
-  if (useMasterOnly)
-    return MASTER_ADDRESS;
-  return moduleAddresses[slot];
-}
-
-uint8_t activeSlotCount() {
-  return useMasterOnly ? 1 : MAX_BATTERIES;
-}
+uint8_t currentExpectedAddress = FACTORY_DEFAULT_BMS_ADDRESS;
 
 // -----------------------------------------------------------------------------
 // SETUP
@@ -710,10 +699,8 @@ void setup() {
   pinMode(PB14, INPUT_PULLUP);
   pinMode(PB15, INPUT_PULLUP);
 
-  uint8_t dip = readFactoryDipAddress();
-  // If DIP == 0 (all switches OFF): single BMS mode (address 0x04)
-  // If DIP > 0: multi-module scan mode (addresses 0x01..0x04)
-  useMasterOnly = (dip == 0);
+  const uint8_t dip = readFactoryDipAddress();
+  selectedBmsAddress = dip == 0 ? FACTORY_DEFAULT_BMS_ADDRESS : dip;
 
   // Indicators (PB0, PB1, PC5, PC13)
   pinMode(PIN_LED_RUN, OUTPUT);
@@ -755,7 +742,7 @@ void loop() {
     if (now - pollTimer >= BMS_POLL_INTERVAL_MS) {
       pollTimer = now;
       rxIndex = 0;
-      currentExpectedAddress = getAddressForSlot(currentBatteryIndex);
+      currentExpectedAddress = selectedBmsAddress;
       sendBmsRequest(currentExpectedAddress);
       waitingForResponse = true;
       responseStartTime = now;
@@ -767,17 +754,13 @@ void loop() {
         rxBuffer[rxIndex++] = b;
 
       if (rxIndex >= BMS_RESPONSE_LEN) {
-        if (parseBmsResponse(rxBuffer, rxIndex, currentExpectedAddress,
-                             currentBatteryIndex)) {
+        if (parseBmsResponse(rxBuffer, rxIndex, currentExpectedAddress, 0)) {
           // Successful telemetry parse: trigger visible non-blocking LED blink
           digitalWrite(PIN_LED_BMS_485, HIGH);
           ledBmsPulseUntil = now + LED_PULSE_DURATION_MS;
         }
 
         waitingForResponse = false;
-        currentBatteryIndex++;
-        if (currentBatteryIndex >= activeSlotCount())
-          currentBatteryIndex = 0;
         break;
       }
     }
@@ -785,9 +768,6 @@ void loop() {
     if (waitingForResponse &&
         (now - responseStartTime > BMS_RESPONSE_TIMEOUT_MS)) {
       waitingForResponse = false;
-      currentBatteryIndex++;
-      if (currentBatteryIndex >= activeSlotCount())
-        currentBatteryIndex = 0;
     }
   }
 
@@ -802,8 +782,10 @@ void loop() {
     processDeyeCanRequests();
 
   // The regular 500 ms update is required even if the inverter sends no poll.
+  // A received 0x305 is answered by this next permitted slot, never by an
+  // early frame that would violate Deye's >=500 ms update interval.
   static uint32_t lastCanTime = 0;
-  if (canReady && (deyePollRequested || now - lastCanTime >= CAN_PERIOD_MS)) {
+  if (canReady && now - lastCanTime >= CAN_PERIOD_MS) {
     deyePollRequested = false;
     lastCanTime = now;
     sendDeyeCanFrames();
