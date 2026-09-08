@@ -14,6 +14,7 @@
 - `GD32F305RC_COMBOX.ld` - Linker script for standalone firmware at flash base
 - `src/main.cpp` - Application logic (Vision Modbus RTU -> Deye LV-CAN)
 - `DEYE_CAN_PROTOCOL.md` - Підтверджений формат кадрів Deye LV-CAN та правила безпечної трансляції
+- `PCS485_DIAGNOSTICS.md` - Стендова перевірка BMS -> COMBOX -> Mac через PCS-RS485
 - `FACTORY_PIN_ANALYSIS.md` - Аналіз заводської прошивки та реверс-інжиніринг
 - `FLASHING_INSTRUCTIONS.md` - Детальна інструкція з прошивки через ST-Link
 
@@ -32,7 +33,7 @@ The MCU on the board is **GD32F305RCT6**. We use the `genericSTM32F103RC` Platfo
   - `PB0` (`LED3` Running): Heartbeat-миготіння кожні 1000 мс.
   - `PB1` (`LED4` BMS-485 Connect): Імпульс 40 мс при отриманні пакету від BMS.
   - `PC5` (`LED6` PCS-CAN Connect): Імпульс 40 мс при відправці CAN-кадрів інвертору.
-  - `PC13` (`LED5` PCS-485 Connect): Вимкнено (LOW).
+  - `PC13` (`LED5` PCS-485 Connect): Імпульс 40 мс після валідного запиту Mac до діагностичного PCS-RS485.
 - **DIP-перемикач:** `PB12` (1), `PB13` (2), `PB14` (4), `PB15` (8), active-low з pull-up.
   - Логічне значення DIP `0` (усі входи підтягнуті в `HIGH`) вибирає заводську адресу Pack 16: `0x10`.
   - Значення DIP `1..15` напряму вибирає Modbus-адресу `0x01..0x0F`. Наприклад, для живого тесту Vision на `0x04` потрібне значення DIP `4`.
@@ -51,6 +52,10 @@ The MCU on the board is **GD32F305RCT6**. We use the `genericSTM32F103RC` Platfo
   - `0020` (байти 43-44): Temp Max (22 °C).
   - `0021` (байти 45-46): Cap Remaining (`0x000F` = 15 Ah).
   - `0022` (байти 47-48): Max charging Current (`0x0064` = 100 A).
+
+## PCS-RS485: стендова діагностика без інвертора
+
+Прошивка активує фізичний порт PCS-RS485 (`PC12` TX, `PD2` RX) як локальний read-only Modbus RTU slave `0x01`, 9600 8N1. Порт повертає вже перевірену телеметрію Vision BMS; він не є емулятором протоколу Deye RS485 і не надсилає дані самостійно. Детальні налаштування Mac, проводка та карта регістрів: `PCS485_DIAGNOSTICS.md`.
   - `0023` (байти 49-50): SOH (0-100%, `0x0064` = 100%).
   - `0024` (байти 51-52): SOC (0-100%, `0x001F` = 31% при напрузі 49.27 В = 3.28 В/комірку).
   - `0025..0027` (байти 53..58): Status, Warning, Protection прапорці.

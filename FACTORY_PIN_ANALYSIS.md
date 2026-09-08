@@ -75,9 +75,9 @@ direction control. A continuity measurement from the transceiver-side `DE` and
 ## Changes applied to the standalone firmware
 
 - BMS polling now uses factory channel 0: `USART1`, `PA9`/`PA10`, 9600 8N1.
-- The second RS485 channel remains identified as PCS-485 on `UART5`,
-  `PC12`/`PD2`; the current Deye implementation uses CAN and does not initialize
-  this UART.
+- The second RS485 channel is PCS-485 on `UART5`, `PC12`/`PD2`. The current
+  standalone firmware initializes it as a local read-only Modbus diagnostic
+  endpoint for a Mac; Deye communication itself remains on CAN.
 - CAN remains on remapped `CAN1`, `PB8`/`PB9`.
 - Indicators use `PB0`, `PB1`, `PC5`, and `PC13` according to the factory code.
 - DIP inputs `PB12` through `PB15` are initialized with pull-ups and captured at

@@ -17,12 +17,14 @@
   - PB0:  LED3 Running (Active High, Heartbeat)
   - PB1:  LED4 BMS-485 Connect (Active High, Activity Blink)
   - PC5:  LED6 PCS-CAN Connect (Active High, Activity Blink)
-  - PC13: LED5 PCS-485 Connect (Active High, Inactive/LOW)
+  - PC12: PCS RS485 TX (UART5 TX, AF Push-Pull 50MHz)
+  - PD2:  PCS RS485 RX (UART5 RX, Floating Input)
+  - PC13: LED5 PCS-485 Connect (Active High, Diagnostic Activity Blink)
   - PC3:  Factory control line -> LOW (Confirmed)
   - PC4:  Factory control line -> HIGH (Confirmed)
   - PB12..PB15: DIP switches 1..4 (Active Low, Input Pullup)
   - PA1:  NOT USED (No manual DE/RE; board has automatic hardware direction)
-  - PC10/PC11, PC12/PD2, PD0/PD1: NOT USED
+  - PC10/PC11, PD0/PD1: NOT USED
 */
 
 // -----------------------------------------------------------------------------
@@ -38,6 +40,9 @@
 
 // USART1 base in STM32 CMSIS (0x40013800 = USART0 in GD32 SPL)
 #define COMBOX_BMS_USART ((USART_TypeDef *)0x40013800UL)
+
+// UART5 is the factory PCS-RS485 channel: PC12 TX / PD2 RX.
+#define COMBOX_PCS485_UART ((USART_TypeDef *)0x40005000UL)
 
 // CAN partial remap (PB8 RX, PB9 TX): AFIO_MAPR bit 14 (CAN_REMAP = 0b10)
 #define COMBOX_CAN_REMAP 0x00004000UL
@@ -58,6 +63,13 @@ static uint8_t selectedBmsAddress = FACTORY_DEFAULT_BMS_ADDRESS;
 static constexpr uint16_t BMS_START_REGISTER = 0x0000;
 static constexpr uint16_t BMS_REGISTER_COUNT = 0x0027; // 39 registers
 static constexpr uint16_t BMS_RESPONSE_LEN   = 83;     // 1(addr) + 1(func) + 1(len=78) + 78(data) + 2(crc)
+
+// Bench-only diagnostic endpoint on the physical PCS-RS485 connector. It is
+// intentionally a local Modbus RTU slave, not an emulation of Deye RS485.
+static constexpr uint8_t PCS485_DIAG_ADDRESS = 0x01;
+static constexpr uint16_t PCS485_DIAG_REG_COUNT = 0x0027;
+static constexpr uint16_t PCS485_DIAG_MAGIC = 0xC0B0;
+static constexpr uint16_t PCS485_DIAG_BASE = 0x0100;
 
 // Timing parameters
 static constexpr uint32_t BMS_POLL_INTERVAL_MS   = 300;   // Poll BMS every 300ms
@@ -125,6 +137,7 @@ BatteryTelemetry bmsData[MAX_BATTERIES];
 // Non-blocking LED pulse timers
 uint32_t ledBmsPulseUntil = 0;
 uint32_t ledCanPulseUntil = 0;
+uint32_t ledPcs485PulseUntil = 0;
 
 // -----------------------------------------------------------------------------
 // DIP SWITCH READER (PB12..PB15, Active Low)
@@ -222,6 +235,53 @@ uint8_t bmsUartRead() {
 
 void bmsUartFlush() {
   while (!(COMBOX_BMS_USART->SR & USART_SR_TC)) {
+  }
+}
+
+// -----------------------------------------------------------------------------
+// PCS RS485 UART5 (PC12 TX / PD2 RX, 9600 8N1)
+// -----------------------------------------------------------------------------
+void initPcs485Uart() {
+  RCC->APB1ENR |= RCC_APB1ENR_UART5EN;
+  RCC->APB2ENR |= (1UL << 4) | (1UL << 5); // GPIOCEN, GPIODEN
+
+  // PC12 TX: alternate-function push-pull, 50 MHz (MODE=11, CNF=10 -> 0xB)
+  GPIOC->CRH &= ~(0xFUL << 16);
+  GPIOC->CRH |= (0xBUL << 16);
+
+  // PD2 RX: floating input (MODE=00, CNF=01 -> 0x4)
+  GPIOD->CRL &= ~(0xFUL << 8);
+  GPIOD->CRL |= (0x4UL << 8);
+
+  COMBOX_PCS485_UART->CR1 = 0;
+  COMBOX_PCS485_UART->CR2 = 0;
+  COMBOX_PCS485_UART->CR3 = 0;
+
+  const uint32_t pclk1 = HAL_RCC_GetPCLK1Freq();
+  COMBOX_PCS485_UART->BRR = (pclk1 + (9600U / 2U)) / 9600U;
+  COMBOX_PCS485_UART->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
+}
+
+bool pcs485UartAvailable() {
+  const uint32_t sr = COMBOX_PCS485_UART->SR;
+  if (sr & (USART_SR_ORE | USART_SR_NE | USART_SR_FE)) {
+    (void)COMBOX_PCS485_UART->DR;
+    return false;
+  }
+  return (sr & USART_SR_RXNE) != 0;
+}
+
+uint8_t pcs485UartRead() {
+  return (uint8_t)COMBOX_PCS485_UART->DR;
+}
+
+void pcs485UartWriteBuffer(const uint8_t *data, uint16_t len) {
+  for (uint16_t i = 0; i < len; i++) {
+    while (!(COMBOX_PCS485_UART->SR & USART_SR_TXE)) {
+    }
+    COMBOX_PCS485_UART->DR = data[i];
+  }
+  while (!(COMBOX_PCS485_UART->SR & USART_SR_TC)) {
   }
 }
 
@@ -512,6 +572,119 @@ bool parseBmsResponse(const uint8_t *buf, uint16_t len, uint8_t expectedAddress,
 }
 
 // -----------------------------------------------------------------------------
+// PCS-RS485 DIAGNOSTIC MODBUS SLAVE
+// -----------------------------------------------------------------------------
+// The Mac reads this endpoint instead of talking to the BMS bus directly.
+// Registers 0x0000..0x0026 mirror the parsed Vision telemetry. Registers
+// 0x0100..0x0103 provide diagnostic state for the bench setup.
+uint16_t readPcs485DiagnosticRegister(uint16_t reg) {
+  const BatteryTelemetry &bat = bmsData[0];
+
+  if (reg >= PCS485_DIAG_BASE) {
+    switch (reg) {
+      case 0x0100: return PCS485_DIAG_MAGIC;
+      case 0x0101: return selectedBmsAddress;
+      case 0x0102: return bat.valid ? 1 : 0;
+      case 0x0103:
+        if (!bat.valid)
+          return 0xFFFF;
+        return clampU16((millis() - bat.lastSeen) / 100U, 0xFFFE);
+      default: return 0;
+    }
+  }
+
+  // Match the CAN fail-safe: stale BMS telemetry must never look current.
+  if (!bat.valid)
+    return 0;
+
+  switch (reg) {
+    case 0: return bat.totalVoltageRaw;
+    case 1: return (uint16_t)bat.currentRaw;
+    case 18: return (uint16_t)bat.tempPCB;
+    case 19: return (uint16_t)bat.tempAvg;
+    case 20: return (uint16_t)bat.tempMax;
+    case 21: return bat.remainCapRaw;
+    case 22: return bat.maxChargeCurrentRaw;
+    case 23: return bat.soh;
+    case 24: return bat.soc;
+    case 25: return bat.status;
+    case 26: return bat.warning;
+    case 27: return bat.protection;
+    default:
+      if (reg >= 2 && reg <= 17)
+        return bat.cellVoltages[reg - 2];
+      return 0;
+  }
+}
+
+bool isPcs485DiagnosticRangeValid(uint16_t start, uint16_t count) {
+  if (count == 0 || count > PCS485_DIAG_REG_COUNT)
+    return false;
+
+  const uint32_t end = (uint32_t)start + count;
+  return end <= PCS485_DIAG_REG_COUNT ||
+         (start >= PCS485_DIAG_BASE && end <= PCS485_DIAG_BASE + 4U);
+}
+
+void sendPcs485DiagnosticResponse(const uint8_t request[8]) {
+  if (request[0] != PCS485_DIAG_ADDRESS || request[1] != 0x03)
+    return;
+
+  const uint16_t requestCrc = (uint16_t)request[6] | ((uint16_t)request[7] << 8);
+  if (calculateCRC16(request, 6) != requestCrc)
+    return;
+
+  const uint16_t start = be16(&request[2]);
+  const uint16_t count = be16(&request[4]);
+  if (!isPcs485DiagnosticRangeValid(start, count))
+    return;
+
+  uint8_t response[3 + (PCS485_DIAG_REG_COUNT * 2) + 2] = {
+      PCS485_DIAG_ADDRESS, 0x03, (uint8_t)(count * 2)};
+  for (uint16_t i = 0; i < count; i++) {
+    const uint16_t value = readPcs485DiagnosticRegister(start + i);
+    response[3 + (i * 2)] = (uint8_t)(value >> 8);
+    response[4 + (i * 2)] = (uint8_t)value;
+  }
+
+  const uint16_t responseLen = 3 + (count * 2);
+  const uint16_t responseCrc = calculateCRC16(response, responseLen);
+  response[responseLen] = (uint8_t)responseCrc;
+  response[responseLen + 1] = (uint8_t)(responseCrc >> 8);
+  pcs485UartWriteBuffer(response, responseLen + 2);
+
+  digitalWrite(PIN_LED_PCS_485, HIGH);
+  ledPcs485PulseUntil = millis() + LED_PULSE_DURATION_MS;
+}
+
+void processPcs485DiagnosticRequests() {
+  static uint8_t request[8] = {0};
+  static uint8_t requestLen = 0;
+  static uint32_t lastByteTime = 0;
+
+  while (pcs485UartAvailable()) {
+    const uint8_t byte = pcs485UartRead();
+    lastByteTime = millis();
+
+    if (requestLen < sizeof(request)) {
+      request[requestLen++] = byte;
+    } else {
+      requestLen = 0;
+      continue;
+    }
+
+    if (requestLen == sizeof(request)) {
+      sendPcs485DiagnosticResponse(request);
+      requestLen = 0;
+    }
+  }
+
+  // Discard a partial request after the Modbus RTU inter-frame gap.
+  if (requestLen != 0 && millis() - lastByteTime > 10)
+    requestLen = 0;
+}
+
+// -----------------------------------------------------------------------------
 // SAFETY LOGIC
 // -----------------------------------------------------------------------------
 bool chargeAllowedByProtection(uint16_t p) {
@@ -723,6 +896,9 @@ void setup() {
   // Initialize BMS UART (USART1/USART0: PA9 TX / PA10 RX)
   initBmsUart();
 
+  // Initialize the local diagnostic endpoint (UART5: PC12 TX / PD2 RX).
+  initPcs485Uart();
+
   // Initialize CAN (CAN1/CAN0: PB8 RX / PB9 TX, 500k)
   canReady = initCAN_500k();
 
@@ -777,7 +953,10 @@ void loop() {
       bmsData[i].valid = false;
   }
 
-  // 3. Read Deye's optional 0x305 poll request, then send Deye LV-CAN data.
+  // 3. Serve local read-only telemetry to a USB-RS485 adapter on PCS-485.
+  processPcs485DiagnosticRequests();
+
+  // 4. Read Deye's optional 0x305 poll request, then send Deye LV-CAN data.
   if (canReady)
     processDeyeCanRequests();
 
@@ -791,7 +970,7 @@ void loop() {
     sendDeyeCanFrames();
   }
 
-  // 4. Non-blocking LED Pulse Resets
+  // 5. Non-blocking LED Pulse Resets
   if (ledBmsPulseUntil != 0 && now >= ledBmsPulseUntil) {
     digitalWrite(PIN_LED_BMS_485, LOW);
     ledBmsPulseUntil = 0;
@@ -800,8 +979,12 @@ void loop() {
     digitalWrite(PIN_LED_PCS_CAN, LOW);
     ledCanPulseUntil = 0;
   }
+  if (ledPcs485PulseUntil != 0 && now >= ledPcs485PulseUntil) {
+    digitalWrite(PIN_LED_PCS_485, LOW);
+    ledPcs485PulseUntil = 0;
+  }
 
-  // 5. RUN Heartbeat (PB0 toggles every 1 second)
+  // 6. RUN Heartbeat (PB0 toggles every 1 second)
   static uint32_t lastBlink = 0;
   if (now - lastBlink >= 1000) {
     lastBlink = now;
